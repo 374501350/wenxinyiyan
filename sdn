@@ -1,0 +1,2228 @@
+#!/usr/bin/python
+# coding=utf-8
+
+import json
+import re
+import urllib2
+import base64
+import time 
+import sys
+import os
+import pymysql
+import sys
+
+#reload(sys)
+#sys.setdefaultencoding('utf-8')
+
+Version = '1.0'
+
+class db_manager:
+    def __init__(self, host, username, password, db, port=3306, charset='utf8'):
+        self.host = host
+        self.user = username
+        self.password = password
+        self.db = db
+        self.port = port
+        self.charset = charset
+    
+    def connect(self):
+        self.conn = pymysql.connect(
+            host=self.host,
+            port=self.port,
+            user=self.user,
+            password=self.password,
+            database=self.db,
+            charset=self.charset
+        )
+        self.cursor = self.conn.cursor()
+
+    def rollback(self):
+        self.conn.rollback()
+ 
+    def close(self):
+        if self.cursor:
+            self.cursor.close()
+        if self.conn:
+            self.conn.close()
+    
+    def fetch_one(self, sql):
+        self.cursor.execute(sql)
+        return self.cursor.fetchone()
+    
+    def fetch_all(self, sql):
+        self.cursor.execute(sql)
+        return self.cursor.fetchall()
+    
+    def create(self, table, column):
+        sql = "CREATE TABLE IF NOT EXISTS %s%s;"%(table, column)
+        self.cursor.execute(sql)
+        self.conn.commit()
+    
+    def exec_sql(self, sql):
+        self.cursor.execute(sql)
+        self.conn.commit()
+
+    def update(self, table, column, data, condition):
+        sql = "UPDATE %s SET %s='%s' WHERE %s;"%(table, column, data, condition)
+        self.cursor.execute(sql)
+        self.conn.commit()
+    
+    def delete(self, table, condition):
+        sql = "DELETE FROM %s WHERE '%s';"%(table, condition)
+        self.cursor.execute(sql)
+        self.conn.commit()
+    
+    def verify_login(self, username, password):
+        sql = "SELECT password FROM user WHERE name='%s';"%username
+        try:
+            result = self.fetch_one(sql)
+            if result is None:
+                return False
+            elif password in result:
+                return True
+            return False
+        except Exception as e:
+            print(str(e))
+            self.close()
+            raw_input('... 数据库读写异常，请按回车键退出后重试！ '.encode('utf-8'))
+            sys.exit()
+    
+    #为交换机创建数据表；
+    def create_switch_table(self, switch_ip):
+        column = '(port_name varchar(20),port_number varchar(20), occupied_by varchar(20), occupied_date datetime)'
+        sql = "SELECT table_name FROM information_schema.tables WHERE table_schema = 'sdn_controller' AND table_type = 'BASE TABLE'"
+        try:
+            tables = self.fetch_all(sql)
+            ip = switch_ip.replace('.','_')
+            if not((ip,) in tables):
+                print(sql)
+                self.create(ip, column)
+        except Exception as e:
+            self.rollback()
+            self.close()
+    
+    #将端口信息添加到数据表中
+    def insert_occupied_port(self, switch_ip, port_name, user_name):
+        switch_ip = switch_ip.replace('_', '.')
+        NodesInfo = Nodes.get_switch_port_detail_info()
+        port_number = NodesInfo[switch_ip][port_name]['port_number']
+        sql1 = "SELECT occupied_by FROM %s where port_name='%s'"%(switch_ip.replace('.','_'), port_name)
+        try:
+            result = self.fetch_one(sql1)
+            insert_sql = "INSERT INTO %s (port_name, port_number, occupied_by, occupied_date) VALUES('%s','%s','%s','%s' )"%(switch_ip.replace('.','_'), port_name, port_number, user_name, date)
+            #端口未被占用
+            if result is None: 
+                date = time.strftime('%Y-%m-%d.%H:%M:%S',time.localtime())
+                self.exec_sql(insert_sql)
+                return True
+            #端口已被自己占用
+            elif result[0] == user_name:
+                return True
+            #端口被其他用户占用
+            else:
+                return False
+            
+        except Exception as e:
+            self.rollback()
+            self.close()
+    
+    def check_port_occupation(self, switch_ip):
+        switch_ip = switch_ip.replace('_', '.')
+        NodesInfo = Nodes.get_switch_port_detail_info()
+        sql1 = "SELECT * FROM %s ;"%(switch_ip.replace('.','_'))
+        try:
+            result = self.fetch_all(sql1)
+            #端口未被占用
+            if result is None: 
+                return None
+            #端口被占用
+            else:
+                return result
+            
+        except Exception as e:
+            return None
+    
+    def remove_occupied_port(self, port_name, port_number):
+        #DBMgr.connect()
+        #NodesInfo = Nodes.get_switch_port_detail_info()
+        #for switch_ip in NodesInfo:
+        #    sorted_port_list = Nodes.sort_switch_port(NodesInfo[switch_ip])
+        #    for port_name in sorted_port_list:
+        #        port_number = NodesInfo[switch_ip][port_name]['port_number']
+        #        #print(u'%s %s %s'%(switch_ip, port_name, port_number))
+        #        sql1 = "SELECT * FROM %s where port_name='%s'"%(switch_ip.replace('.','_'), port_name)
+        #        result = DBMgr.fetch_one(sql1)
+        #        if result is None:
+        #            sql2 = "INSERT INTO %s (port_name,port_number) VALUES('%s','%s')"%(switch_ip.replace('.','_'), port_name, port_number)
+        #            DBMgr.fetch_all(sql2)
+        #            
+        #DBMgr.close()
+        pass
+
+class restconf:
+    def __init__(self, controllerip, username='admin', password='admin'):
+        self.controllerip = controllerip
+        self.headers = {'content-type': 'application/json'}
+        self.multi_user_rule_priority_dict = {}
+        self.udf_rule_priority_dict = {}
+        #检查Http响应，200/201均为成功，其余均表示异常
+        self.response = ['<Response [200]>','<Response [201]>']
+        self.username = username
+        self.password = password
+
+    def get_controller_info(self):
+        url = 'http://%s:8181/restconf/operational/uninet:debug' % self.controllerip
+        try:
+            return self.url_get(url)
+        except:
+            print(u'     未查询到任何交换机!')   
+    
+    
+    def get_node_info(self):
+        url = 'http://%s:8181/restconf/operational/opendaylight-inventory:nodes' % self.controllerip
+        try:
+            return self.url_get(url)
+        except:
+            print(u'     连接控制器 \'%s\' 失败，请重试!' % self.controllerip)
+            sys.exit()
+
+    def url_get(self, url):
+        
+        response = None
+        request = urllib2.Request(url)
+        base64string = base64.encodestring('%s:%s' % (self.username, self.password)).replace('\n', '')
+        request.add_header("Authorization", "Basic %s" % base64string)
+        request.get_method = lambda: 'GET'
+        result = urllib2.urlopen(request).read()
+        return json.loads(result)
+
+    def url_put(self, url, json_obj):
+        headers = {}
+        headers['Content-Type'] = 'application/json'
+        json_data = json.dumps(json_obj)
+        response = None
+        
+        try:
+            request = urllib2.Request(url, json_data, headers)
+            base64string = base64.encodestring('%s:%s' % (self.username, self.password)).replace('\n', '')
+            request.add_header("Authorization", "Basic %s" % base64string)
+            request.get_method = lambda: 'PUT'
+            response = urllib2.urlopen(request,timeout=5)
+            return True
+            
+        except urllib2.URLError as e:
+            if hasattr(e, 'code'):
+                print 'Error code:',e.code
+  
+            elif hasattr(e, 'reason'):
+                print 'Reason:',e.reason
+            
+        finally:
+            if response:
+                response.close()
+
+        return False
+
+    def url_delete(self, url):
+        
+        response = None
+        try:
+            request = urllib2.Request(url)
+            base64string = base64.encodestring('%s:%s' % (self.username, self.password)).replace('\n', '')
+            request.add_header("Authorization", "Basic %s" % base64string)
+            request.get_method = lambda: 'DELETE'
+            response = urllib2.urlopen(request,timeout=5)
+            
+        except urllib2.URLError as e:
+            if hasattr(e, 'code'):
+                print 'Error code:',e.code
+  
+            elif hasattr(e, 'reason'):
+                print 'Reason:',e.reason
+                
+        finally:
+            if response:
+                response.close()
+        
+    def del_system_config(self):
+        url = 'http://%s:8181/restconf/config/uninet:system' % self.controllerip
+        self.url_delete(url)
+    
+    def del_host_config(self):
+        url = 'http://%s:8181/restconf/config/uninet:hosts' % self.controllerip
+        self.url_delete(url)
+    
+    def del_tenant_config(self):
+        url = 'http://%s:8181/restconf/config/uninet:tenants' % self.controllerip
+        self.url_delete(url)
+    
+    
+    def get_rule(self, rule_type='all'):
+        url = 'http://%s:8181/restconf/config/uninet:system/packet-redirect' % self.controllerip
+        RuleDict = {}
+        try:
+            RuleInfo = self.url_get(url)
+            if rule_type == 'all':
+                for SrcNode in RuleInfo['packet-redirect']['source-node']:
+                    if SrcNode.has_key('rule'):
+                        RuleDict[SrcNode['id']] = []
+                        for Rule in SrcNode['rule']:
+                            RuleDict[SrcNode['id']].append(Rule)
+                
+            elif rule_type == 'dmac_dynamic':
+                for SrcNode in RuleInfo['packet-redirect']['source-node']:
+                    if SrcNode.has_key('rule'):
+                        RuleDict[SrcNode['id']] = []
+                        for Rule in SrcNode['rule']:
+                            if int(Rule['priority']) >= 1 and int(Rule['priority']) <= 2000:
+                                RuleDict[SrcNode['id']].append(Rule)
+                
+            elif rule_type == 'udf_rule':
+                for SrcNode in RuleInfo['packet-redirect']['source-node']:
+                    if SrcNode.has_key('rule'):
+                        RuleDict[SrcNode['id']] = []
+                        for Rule in SrcNode['rule']:
+                            if int(Rule['priority']) >= 3001 and int(Rule['priority']) <= 4000:
+                                RuleDict[SrcNode['id']].append(Rule)
+            
+            elif rule_type == 'multi_user':
+                for SrcNode in RuleInfo['packet-redirect']['source-node']:
+                    if SrcNode.has_key('rule'):
+                        RuleDict[SrcNode['id']] = []
+                        for Rule in SrcNode['rule']:
+                            if int(Rule['priority']) >= 4001 and int(Rule['priority']) <= 5000:
+                                RuleDict[SrcNode['id']].append(Rule)
+            
+            return RuleDict
+            
+        except:
+            pass
+        
+    def del_rule(self, rule_type='all'):
+        try:
+            RuleDict = self.get_rule(rule_type)
+            Seq = 1
+            for SrcNode in RuleDict.keys():
+                NodeIp = node_info(self.controllerip).get_switch_ip_by_dpid(SrcNode)
+                RuleId = 1
+                for Rule in RuleDict[SrcNode]:
+                    Pct = RuleId * 100 / len(RuleDict[SrcNode])
+                    url = 'http://%s:8181/restconf/config/uninet:system/packet-redirect/source-node/%s/rule/%s'%(
+                    self.controllerip, SrcNode, Rule['priority'])
+                    self.url_delete(url)
+                    print(u'       删除进度%s/%s(%s)[%-20s]%.f%s'%(Seq, len(RuleDict.keys()), NodeIp, '■'*int(Pct/5), Pct, '%'))
+                    sys.stdout.write('\033[F')
+                    RuleId += 1
+                print(u'')
+                Seq += 1
+        except:
+            pass
+    
+    def del_bond_ae_group(self, switch_ip, group_name):
+        url = 'http://%s:8181/restconf/config/uninet:system/add-switch-port/nodes/%s/port/%s'%(
+                    self.controllerip, switch_ip, group_name)
+        group_type = ''
+        try:
+            if 'bond' in group_name:
+                group_type = 'bond'
+            elif 'ae' in group_name:
+                group_type = 'ae'
+            if group_type != '':
+                GroupDict = self.get_bond_ae_group(group_type=group_type, switch_ip=switch_ip)
+                if GroupDict:
+                    if self.is_bond_ae_exist(group_name, switch_ip):
+                        self.url_delete(url)
+                        if not self.is_bond_ae_exist(group_name, switch_ip):
+                            print(u'       交换机IP \'%s\' 端口组 \'%s\' 删除成功！'%(switch_ip, group_name))  
+                        else:
+                            print(u'       交换机IP \'%s\' 端口组 \'%s\' 删除失败，请重试！'%(switch_ip, group_name))
+                    else:
+                        print(u'       交换机IP \'%s\' 不存在端口组 \'%s\' ，请重试！'%(switch_ip, group_name))
+                    
+                else:
+                    print(u'       交换机IP \'%s\' 不存在，请重试！'%switch_ip)
+        
+            else:
+                print(u'       端口组名称 \'%s\' 不合法，请检查后重试！'%group_name)
+        except:
+            print(u'       交换机IP \'%s\' 端口组 \'%s\' 删除失败，请重试！'%(switch_ip, group_name))
+    
+    def config_destination_host(self, priority=1, destination_host="0.0.0.0/0", tenant_id="0"):
+        url = 'http://%s:8181/restconf/config/uninet:system/packet-redirect/destination-host/%s'%(self.controllerip, priority)
+        payload = {"destination-host": [{"priority": "","tenant-id": "0","prefix": ""}]}
+        payload["destination-host"][0]["priority"] = priority
+        payload["destination-host"][0]["tenant-id"] = tenant_id
+        payload["destination-host"][0]["prefix"] = destination_host
+        self.url_put(url, payload)
+    
+    def config_static_host(self, host_ip, host_mac, node_connector):
+        url = 'http://%s:8181/restconf/config/uninet:hosts/host/%s' % (self.controllerip,
+        host_ip)
+        payload = {
+                    "host": [
+                        {
+                            "id": "0-111.111.1.1",
+                            "info": [
+                                {
+                                    "node-connector": "openflow:1234546:123",
+                                    "vid": "1",
+                                    "mac": "00:00:00:00:00:01",
+                                    "tagged": "false"
+                                }
+                                    ]
+                        }
+                    ]
+                }
+        payload["host"][0]["id"] = host_ip
+        payload["host"][0]["info"][0]["node-connector"] = node_connector
+        payload["host"][0]["info"][0]["mac"] = host_mac
+        self.url_put(url, payload)
+
+    def config_bond_group(self, switch_ip, switch_hardware_id, bond_id, port_name_list):
+        bond_name = "bond%s" % (bond_id)
+        url = 'http://%s:8181/restconf/config/uninet:system/add-switch-port/nodes/%s/port/%s' % (
+        self.controllerip, switch_ip, bond_name)
+        payload ={
+                    "port"     : [
+                        {
+                            "port-name": "",
+                            "port-type": "hm_bond",
+                            "options"  : [
+                                {
+                                    "option": "members",
+                                    "value" : ""
+                                }
+                            ]
+                        }
+                    ]
+                }
+        if switch_hardware_id <= 3:
+            payload["port"][0]["port-type"] = 'pica8_bond'
+        payload["port"][0]["port-name"] = bond_name
+        payload["port"][0]["options"][0]["value"] = port_name_list
+        
+        self.url_put(url, payload)
+
+    def config_ae_group(self, switch_ip, switch_hardware_id, ae_id, port_name_list):
+        ae_name = "ae%s" % (ae_id)
+        url = 'http://%s:8181/restconf/config/uninet:system/add-switch-port/nodes/%s/port/%s' % (
+        self.controllerip, switch_ip, ae_name)
+        payload ={
+                    "port"     : [
+                        {
+                            "port-name": "",
+                            "port-type": "hm_lag",
+                            "options"  : [
+                                {
+                                    "option": "members",
+                                    "value" : ""
+                                }
+                            ]
+                        }
+                    ]
+                }
+        if switch_hardware_id <= 3:
+            payload["port"][0]["port-type"] = 'pica8_lag'
+        payload["port"][0]["port-name"] = ae_name
+        payload["port"][0]["options"][0]["value"] = port_name_list
+        
+        self.url_put(url, payload)
+
+    def get_bond_ae_group(self, group_type='bond', switch_ip=''):
+        url = 'http://%s:8181/restconf/config/uninet:system/add-switch-port' % (self.controllerip)
+        GroupDict = {}
+        try:
+            bond_info = self.url_get(url)
+            if switch_ip != '':
+                SwitchExist = False
+                for NodeId in range(len(bond_info['add-switch-port']['nodes'])):
+                    if switch_ip == bond_info['add-switch-port']['nodes'][NodeId]['switch-ip']:
+                        for PortId in range(len(bond_info['add-switch-port']['nodes'][NodeId]['port'])):
+                            BondInfo = bond_info['add-switch-port']['nodes'][NodeId]['port']
+                            if group_type in BondInfo[PortId]['port-name']:
+                                if not GroupDict.has_key(switch_ip):
+                                    GroupDict[switch_ip] = []
+                                    GroupDict[switch_ip].append(BondInfo[PortId])
+                                else:
+                                    GroupDict[switch_ip].append(BondInfo[PortId])
+                        SwitchExist = True
+                if not SwitchExist:
+                    return False
+            else:
+                for NodeId in range(len(bond_info['add-switch-port']['nodes'])):
+                    switch_ip = bond_info['add-switch-port']['nodes'][NodeId]['switch-ip']
+                    for PortId in range(len(bond_info['add-switch-port']['nodes'][NodeId]['port'])):
+                        BondInfo = bond_info['add-switch-port']['nodes'][NodeId]['port']
+                        if group_type in BondInfo[PortId]['port-name']:
+                            if not GroupDict.has_key(switch_ip):
+                                GroupDict[switch_ip] = []
+                                GroupDict[switch_ip].append(BondInfo[PortId])
+                            else:
+                                GroupDict[switch_ip].append(BondInfo[PortId])
+            return GroupDict
+                    
+        except:
+            return False
+    
+    def is_bond_ae_exist(self, group_name, switch_ip):
+        GroupDict = {}
+        try:
+            if 'bond' in group_name:
+                GroupDict = self.get_bond_ae_group(group_type='bond', switch_ip=switch_ip)
+            elif 'ae' in group_name:
+                GroupDict = self.get_bond_ae_group(group_type='ae', switch_ip=switch_ip)
+            
+            for NodeIp in GroupDict.keys():
+                if switch_ip == NodeIp:
+                    for PortId in range(len(GroupDict[NodeIp])):
+                        if group_name == GroupDict[NodeIp][PortId]['port-name']:
+                            return True
+            return False        
+            
+        except:
+            return False
+    
+    def is_port_exist(self, switch_ip, port_name):
+        SwitchPortDict = node_info(self.controllerip).get_switch_port_dict()
+        if switch_ip in SwitchPortDict.keys():
+            for Port in SwitchPortDict[switch_ip]:
+                if port_name == Port['flow-node-inventory:name']:
+                    return True
+            return False
+            
+        else:
+            return False
+    
+    
+    def get_host(self, host_type):
+        url = 'http://%s:8181/restconf/config/uninet:hosts' % (
+        self.controllerip)
+        HostDict = {}
+        try:
+            host_info = self.url_get(url)
+
+            for HostId in range(len(host_info['hosts']['host'])):
+                if host_type =='manual_static':
+                    if '0-100.' in host_info['hosts']['host'][HostId]['id']:
+                        HostDict[host_info['hosts']['host'][HostId]['id']] = host_info['hosts']['host'][HostId]['info']                
+                
+                elif host_type =='udf_static':
+                    if '0-101.' in host_info['hosts']['host'][HostId]['id']:
+                        HostDict[host_info['hosts']['host'][HostId]['id']] = host_info['hosts']['host'][HostId]['info']
+        
+                elif host_type =='multi_user_static':
+                    if '0-102.' in host_info['hosts']['host'][HostId]['id']:
+                        HostDict[host_info['hosts']['host'][HostId]['id']] = host_info['hosts']['host'][HostId]['info']
+                
+                elif host_type =='dynamic':
+                    if '0-111.' in host_info['hosts']['host'][HostId]['id']:
+                        HostDict[host_info['hosts']['host'][HostId]['id']] = host_info['hosts']['host'][HostId]['info']
+                
+                else:
+                    return False
+                
+            return HostDict
+        
+        except:
+            return False
+    
+    #支持模糊删除和精确删除，取决于host_ip输入的位数 
+    def del_static_host(self, host_ip, host_type):
+        #host_ip='0-1.1.1.1'
+        #删除前，检查静态主机是否为空，如果不为空，而且主机ip在静态主机列表中，执行删除操作，否则返回False
+        IsSuccess = False
+        HostDict = self.get_host(host_type)
+        HostIpList = ''
+        if HostDict:
+            HostIpList = HostDict.keys()
+            for HostIp in HostIpList:
+                if host_ip in HostIp:
+                    url = 'http://%s:8181/restconf/config/uninet:hosts/host/%s' % (
+                        self.controllerip, HostIp)
+                    self.url_delete(url)
+   
+        else:
+            return False
+        
+        #删除后，如果静态主机为空，则成功
+        HostDict = self.get_host(host_type)
+        if not HostDict:
+            return True
+        
+        #删除后，如果主机不为空，检查已删除主机是否还在
+        else:
+            for HostIp in HostIpList:
+                if host_ip in HostIp:
+                    print(u'       静态主机：%s 删除失败！'%HostIp[2:])
+                    return False
+                    
+            return True
+    
+    #DMAC重定向规则
+    def config_packet_redirect_rule(self, match_priority=718, switch_ip_list = ''):
+        ConfigHandler = config_handler(self.controllerip)
+        switch_ip_list = switch_ip_list
+        if switch_ip_list == '':    
+            switch_ip_list = node_info(self.controllerip).get_switch_ip_list()
+        for switch_ip in switch_ip_list:
+            payload = {"source-node": [{"id":"", "rule":[]}]}
+            dpid = node_info(self.controllerip).get_switch_dpid_by_ip(switch_ip)
+            payload["source-node"][0]["id"] = dpid
+            #每台交换机下发1500条重定向规则（dmac=00:00:00:00:00:00-00:00:00:00:05:db）
+            for rule_id in range(1500):
+                rule = {
+                        "priority": "",
+                        "match-priority": "",
+                        "match-dmac": "",
+                        "match-dmac-mask": "",
+                        "destination-host": ""
+                        }
+                rule["priority"] = rule_id+1
+                rule["match-priority"] = match_priority
+                rule["match-dmac"] = ConfigHandler.convert_to_mac(rule_id)
+                rule["match-dmac-mask"] = "ff:00:00:00:7f:ff"
+                rule["destination-host"] = ConfigHandler.convert_to_ip(prefix='0-111.111', digit=rule_id)
+                payload["source-node"][0]["rule"].append(rule)
+            url = 'http://%s:8181/restconf/config/uninet:system/packet-redirect/source-node/%s'%(self.controllerip, dpid)
+            IsSuccess = self.url_put(url, payload)
+            if IsSuccess:
+                print(u'     交换机IP: %-15s DPID: %-35s 成功.'%(switch_ip, dpid))
+                
+            else:
+                print(u'     交换机IP: %-15s DPID: %-35s 失败.'%(switch_ip, dpid))
+    
+    #自定义规则
+    
+    def config_udf_rule(self, config, user):
+        ConfigHandler = config_handler(self.controllerip)
+        Config = ConfigHandler.parse_udf_rule(config, user)
+        NodeInfo = node_info(self.controllerip)
+        if Config:
+            for RuleDict in Config:
+                SrcNodeDpid = RuleDict['source-node'][0]['id']
+                RuleId = RuleDict['source-node'][0]['rule'][0]['priority']
+                url = 'http://%s:8181/restconf/config/uninet:system/packet-redirect/source-node/%s/rule/%s'%(self.controllerip, SrcNodeDpid, RuleId)
+                payload = {}
+                payload['rule'] = RuleDict['source-node'][0]['rule']
+                SwitchIp = NodeInfo.get_switch_ip_by_dpid(SrcNodeDpid)
+                IsSuccess = self.url_put(url, payload)
+                if IsSuccess:
+                    print(u'     交换机IP: %-15s DPID: %-35s \n%s%s成功.'%(SwitchIp, SrcNodeDpid, ' '*6, payload))
+                    
+                else:
+                    print(u'     交换机IP: %-15s DPID: %-35s \n%s%s失败.'%(SwitchIp, SrcNodeDpid, ' '*6, payload))
+
+    def config_host_timeout(self, timeout=1800):
+        url = 'http://%s:8181/restconf/config/uninet:tenants/tenant/0/properties'%(self.controllerip)
+        payload = {"properties": {"host-timeout": ""}}
+        payload["properties"]["host-timeout"] = timeout
+        self.url_put(url, payload)
+    
+    def get_host_timeout(self):
+        url = 'http://%s:8181/restconf/config/uninet:tenants/tenant/0/properties'%(self.controllerip)
+        try:
+            payload = self.url_get(url)
+            return int(payload["properties"]["host-timeout"])
+            
+        except:
+            return 0
+
+class config_handler:
+    def __init__(self, controllerip):
+        self.Controller = restconf(controllerip)
+        self.NodeInfo = node_info(controllerip)
+        self.DBMgr = db_manager(
+                        '192.168.3.102',
+                        'root',
+                        'bane@8888',
+                        'sdn_controller'
+                        )
+
+    def parse_config_file(self, config_file):
+        config = []
+        try:
+            get_entries = open(config_file, 'rU')
+            entry_list = [line for line in get_entries.readlines() if line.strip()]
+            get_entries.close()
+        
+        except:
+            print(u'       配置文件 \'%s\'获取失败，请检查文件名是否正确！'%config_file)
+            return False
+        
+        try:
+            for line in range(len(entry_list)):
+            
+                if entry_list[line][0] != '#':
+            
+                    entry = eval(entry_list[line])
+                    entry['line'] = line + 1
+                    config.append(entry)
+            
+            return config
+        
+        except:
+            print(u'       配置文件 \'%s\'解析失败，请检查文件内容后重试！'%config_file)
+            return False
+
+    def parse_udf_rule(self, config, user):
+        rule_dict = {}
+        MatchPriority = 1000
+        UdfRuleConfig = self.parse_config_file(config)
+        HostId = 1
+        OccupiedPortDict = {}
+        rule_num_limit = 100
+        SourceNodeList = []
+        #检查规则数量是否符合要求。
+        if len(UdfRuleConfig) > 0 and len(UdfRuleConfig) <= rule_num_limit:
+            self.DBMgr.connect()
+            sql = "select min_priority from user where name='%s';"%user
+            HostId = int(self.DBMgr.fetch_one(sql)[0])
+            #遍历规则，检查输入输出交换机IP、输入输出端口号是否合法可用。
+            for Line in range(len(UdfRuleConfig)):
+                #重定向规则Json格式
+                rule = {
+                        'source-node': [
+                            {
+                                'id': '',
+                                'rule': [
+                                    {
+                                    
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                print(UdfRuleConfig[Line])
+                #如果配置了输入交换机
+                if UdfRuleConfig[Line].has_key('in-switch') and (UdfRuleConfig[Line]['in-switch'] in self.NodeInfo.get_switch_ip_list()):
+                    #如果配置了输入物理端口
+                    if UdfRuleConfig[Line].has_key('in-port'):        
+                        InPort = self.convert_to_port_name_list(SwitchHardwareId, UdfRuleConfig[Line]['in-port'])
+                        #如果输入物理端口不存在
+                        if not self.Controller.is_port_exist(UdfRuleConfig[Line]['in-switch'], InPort):
+                            print(u'    第%s行：输入交换机IP \'%s\' 不存在端口 \' %s \' （%s），请重试!'%(UdfRuleConfig[Line]['line'], UdfRuleConfig[Line]['in-switch'],UdfRuleConfig[Line]['in-port'],InPort))
+                            return
+                        #如果输入物理端口存在，检查是否被占用
+                        else:
+                            switch_ip = UdfRuleConfig[Line]['in-switch'].replace('.','_')
+                            sql = "SELECT occupied_by FROM %s WHERE port_name='%s'"%(
+                                switch_ip,
+                                InPort
+                                )
+                            result = self.DBMgr.fetch_one(sql)
+                            #如果未被占用，则将端口信息暂存至SwitchPortDict
+                            if result is None:
+                                if not OccupiedPortDict.has_key(switch_ip):
+                                    OccupiedPortDict[switch_ip] = []
+                                OccupiedPortDict[switch_ip].append(InPort)
+                            
+                            #如果已被自己占用，则不做任何处理
+                            elif result == (user,):
+                                pass
+                            
+                            #如果已被其他用户占用，则提示错误信息并中断
+                            else:
+                                print(u'    第%s行：输入交换机IP \'%s\' 端口 \' %s \' （%s）已被用户 \'%s\' 占用，请检查后重试!'%(UdfRuleConfig[Line]['line'], UdfRuleConfig[Line]['in-switch'],UdfRuleConfig[Line]['in-port'],InPort,result[0]))
+                                return    
+                            
+                            #如果配置了输出交换机，而且交换机IP存在
+                            if UdfRuleConfig[Line].has_key('out-switch') and (UdfRuleConfig[Line]['out-switch'] in self.NodeInfo.get_switch_ip_list()):
+                                #如果输出端口不存在，则提示错误信息并中断      
+                                OutPort = self.convert_to_port_name_list(SwitchHardwareId, UdfRuleConfig[Line]['out-port'])
+                                if not Controller.is_port_exist(UdfRuleConfig[Line]['out-switch'], OutPort):
+                                    print(u'    第%s行：输出交换机IP \'%s\' 不存在端口 \' %s \' （%s），请重试!'%(UdfRuleConfig[Line]['line'], UdfRuleConfig[Line]['out-switch'],UdfRuleConfig[Line]['out-port'],OutPort))
+                                    return
+                                
+                                #如果输出端口存在
+                                else:
+                                    switch_ip = UdfRuleConfig[Line]['out-switch'].replace('.','_')
+                                    sql = "SELECT occupied_by FROM %s WHERE port_name='%s'"%(
+                                        switch_ip,
+                                        OutPort
+                                        )
+                                    result = self.DBMgr.fetch_one(sql)
+                                    #如果未被占用，则将端口信息暂存至OccupiedPortDict
+                                    if (result is None) or (result == (user,)):
+                                        if not OccupiedPortDict.has_key(switch_ip):
+                                            OccupiedPortDict[switch_ip] = []
+                                        OccupiedPortDict[switch_ip].append(OutPort)
+                                    
+                                    #如果已被自己占用，则不做任何处理
+                                    elif result == (user,):
+                                        pass
+                                    
+                                    #如果已被占用，则提示错误信息并中断
+                                    else:
+                                        print(u'    第%s行：输出交换机IP \'%s\' 的端口 \' %s \' （%s）已被用户 \'%s\' 占用，请检查后重试!'%(UdfRuleConfig[Line]['line'], UdfRuleConfig[Line]['out-switch'],UdfRuleConfig[Line]['out-port'],OutPort,result[0]))
+                                        break    
+                                
+                                #全部校验通过，正式生成规则
+                                #创建输入输出交换机的mysql数据表单
+                                SwitchHardwareId = self.NodeInfo.check_switch_hardware(UdfRuleConfig[Line]['in-switch'])
+                                self.DBMgr.create_switch_table(UdfRuleConfig[Line]['in-switch'])
+                                SwitchHardwareId = self.NodeInfo.check_switch_hardware(UdfRuleConfig[Line]['out-switch'])
+                                self.DBMgr.create_switch_table(UdfRuleConfig[Line]['out-switch'])
+                                #获取输入交换机的DPID
+                                SourceNode = self.NodeInfo.get_switch_dpid_by_ip(UdfRuleConfig[Line]['in-switch'])
+                                #配置静态主机，将输出口绑定到静态主机
+                                DestHost = self.convert_to_ip(HostId, prefix = '0-101.1')
+                                HostMac = self.convert_to_mac(HostId+0x10100000)
+                                self.Controller.config_static_host(DestHost, HostMac, HostPort)
+                                HostId += 1
+                                #如果配置了输入物理端口
+                                if not (SourceNode in SourceNodeList):
+                                    SourceNodeList.append(SourceNode)
+                                
+                                DestHost = ''
+                                HostPort = self.convert_to_ofport(UdfRuleConfig[Line]['out-switch'], OutPort)
+                                
+                            
+                            #如果输出交换机ip不存在，则提示错误信息并中断
+                            elif UdfRuleConfig[Line].has_key('out-switch') and (UdfRuleConfig[Line]['out-switch'] not in self.NodeInfo.get_switch_ip_list()):
+                                pass
+                            
+                            #如果未配置输出交换机ip，则提示错误信息并中断
+                            else:
+                                print(u'    第%s行：输出交换机IP \'%s\' 不存在，请重试!'%(UdfRuleConfig[Line]['line'], UdfRuleConfig[Line]['out-switch']))
+                                return
+                                        
+                            
+                            
+                        SrcPort = self.convert_to_port_id(UdfRuleConfig[Line]['in-switch'], InPort)
+                                    
+                    #如果未配置输入物理端口，则提示错误信息并中断  
+                    else:
+                        print(u'    第%s行：输入交换机未配置物理端口，请重试!'%(UdfRuleConfig[Line]['line']))
+                        return
+                    
+                #如果配置的输入交换机IP不存在，则提示错误信息并中断   
+                elif UdfRuleConfig[Line].has_key('in-switch') and (UdfRuleConfig[Line]['in-switch'] not in self.NodeInfo.get_switch_ip_list()):
+                    print(u'    第%s行：输入交换机IP \'%s\' 不存在，请重试!'%(UdfRuleConfig[Line]['line'], UdfRuleConfig[Line]['in-switch']))
+                    break
+                    
+                #如果未配置输入交换机，则提示错误信息并中断    
+                else:
+                    print(u'    第%s行：未配置输入交换机IP，请重试!'%(UdfRuleConfig[Line]['line']))
+                    break
+        
+        #如果规则数量大于rule_num_limit，则提示错误信息并退出
+        elif len(UdfRuleConfig) > rule_num_limit:
+            print(u'    规则数量大于%条，请减少规则数量后重试！'%(rule_num_limit))
+            return
+        
+        #如果规则数量为0，则提示错误信息并退出    
+        else:
+            print(u'    未检测到有效规则，请检查规则后重试！')
+            return
+
+
+        
+        for Line in range(len(UdfRuleConfig)):
+            rule = {
+                        'source-node': [
+                            {
+                                'id': '',
+                                'rule': [
+                                    {
+                                    
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+            
+            if not Priority.has_key(SourceNode):
+                Priority[SourceNode] = 3001
+            
+            rule['source-node'][0]['id'] = SourceNode
+            rule['source-node'][0]['rule'][0]['priority'] = Priority[SourceNode]
+            if UdfRuleConfig[Line].has_key('priority'):
+                if UdfRuleConfig[Line]['priority'] != '':
+                    rule['source-node'][0]['rule'][0]['match-priority'] = UdfRuleConfig[Line]['priority']
+            else:
+                rule['source-node'][0]['rule'][0]['match-priority'] = MatchPriority
+            if UdfRuleConfig[Line].has_key('in-port'):
+                if SrcPort != '':
+                    rule['source-node'][0]['rule'][0]['match-port'] = SrcPort
+            if UdfRuleConfig[Line].has_key('vid'):
+                if UdfRuleConfig[Line]['vid'] != '':
+                    rule['source-node'][0]['rule'][0]['match-vid'] = UdfRuleConfig[Line]['vid']
+            if UdfRuleConfig[Line].has_key('smac'):
+                if UdfRuleConfig[Line]['smac'] != '':
+                    rule['source-node'][0]['rule'][0]['match-smac'] = UdfRuleConfig[Line]['smac']
+            if UdfRuleConfig[Line].has_key('smac-mask'):
+                if UdfRuleConfig[Line]['smac-mask'] != '':
+                    rule['source-node'][0]['rule'][0]['match-smac-mask'] = UdfRuleConfig[Line]['smac-mask']
+            if UdfRuleConfig[Line].has_key('dmac'):
+                if UdfRuleConfig[Line]['dmac'] != '':
+                    rule['source-node'][0]['rule'][0]['match-dmac'] = UdfRuleConfig[Line]['dmac']
+            if UdfRuleConfig[Line].has_key('dmac-mask'):
+                if UdfRuleConfig[Line]['dmac-mask'] != '':
+                    rule['source-node'][0]['rule'][0]['match-dmac-mask'] = UdfRuleConfig[Line]['dmac-mask']
+            if UdfRuleConfig[Line].has_key('src-ip'):
+                if UdfRuleConfig[Line]['src-ip'] != '':
+                    rule['source-node'][0]['rule'][0]['match-src-ip'] = UdfRuleConfig[Line]['src-ip']
+            if UdfRuleConfig[Line].has_key('src-ip-mask'):
+                if UdfRuleConfig[Line]['src-ip-mask'] != '':
+                    rule['source-node'][0]['rule'][0]['match-src-ip-mask'] = UdfRuleConfig[Line]['src-ip-mask']
+            if UdfRuleConfig[Line].has_key('dst-ip'):
+                if UdfRuleConfig[Line]['dst-ip'] != '':
+                    rule['source-node'][0]['rule'][0]['match-dst-ip'] = UdfRuleConfig[Line]['dst-ip']
+            if UdfRuleConfig[Line].has_key('dst-ip-mask'):
+                if UdfRuleConfig[Line]['dst-ip-mask'] != '':
+                    rule['source-node'][0]['rule'][0]['match-dst-ip-mask'] = UdfRuleConfig[Line]['dst-ip-mask']
+            if UdfRuleConfig[Line].has_key('ip-protocol'):
+                if UdfRuleConfig[Line]['ip-protocol'] != '':
+                    rule['source-node'][0]['rule'][0]['match-protocol'] = UdfRuleConfig[Line]['ip-protocol']
+            if UdfRuleConfig[Line].has_key('src-port'):
+                if UdfRuleConfig[Line]['src-port'] != '':
+                    rule['source-node'][0]['rule'][0]['match-src-port'] = UdfRuleConfig[Line]['src-port']
+            if UdfRuleConfig[Line].has_key('dst-port'):
+                if UdfRuleConfig[Line]['dst-port'] != '':
+                    rule['source-node'][0]['rule'][0]['match-dst-port'] = UdfRuleConfig[Line]['dst-port']        
+            rule['source-node'][0]['rule'][0]['destination-host'] = DestHost
+            
+            UdfRuleList.append(rule)
+            Priority[SourceNode] += 1
+            
+            #标记端口为占用状态
+            for switch_ip in OccupiedPortDict.keys():
+                for port_name in OccupiedPortDict[switch_ip]:
+                    self.DBMgr.insert_occupied_port(switch_ip, port_name, user)
+            self.DBMgr.close()
+            return UdfRuleList
+    
+    '''
+    def parse_udf_rule(self, config, user):
+        Priority = {}
+        MatchPriority = 1000
+        UdfRuleConfig = self.parse_config_file(config)
+        UdfRuleList = []
+        HostId = 1
+        OccupiedPortDict = {}
+        if UdfRuleConfig:
+            self.DBMgr.connect()
+            for Line in range(len(UdfRuleConfig)):
+                print(UdfRuleConfig[Line])
+                SourceNodeList = []
+                DestHost = ''
+                SrcPort = ''
+                #如果配置了输入交换机，则只在输入交换机上下发规则
+                if UdfRuleConfig[Line].has_key('in-switch') and (UdfRuleConfig[Line]['in-switch'] in self.NodeInfo.get_switch_ip_list()):
+                    SwitchHardwareId = self.NodeInfo.check_switch_hardware(UdfRuleConfig[Line]['in-switch'])
+                    self.DBMgr.create_switch_table(UdfRuleConfig[Line]['in-switch'])
+                    if UdfRuleConfig[Line]['in-switch'] in self.NodeInfo.get_switch_ip_list():
+                        SourceNode = self.NodeInfo.get_switch_dpid_by_ip(UdfRuleConfig[Line]['in-switch'])
+                        SourceNodeList.append(SourceNode)
+                        if UdfRuleConfig[Line].has_key('in-port'):
+                            #判断输入bond或者ae是否存在
+                            if ('ae' in UdfRuleConfig[Line]['in-port']) or ('bond' in UdfRuleConfig[Line]['in-port']):
+                                if not self.Controller.is_port_exist(UdfRuleConfig[Line]['in-switch'], UdfRuleConfig[Line]['in-port']):
+                                    print(u'    第%s行：输入交换机IP \'%s\' 不存在端口组 \' %s \'，请重试!'%(UdfRuleConfig[Line]['line'], UdfRuleConfig[Line]['in-switch'],UdfRuleConfig[Line]['in-port']))
+                                    return
+                                
+                                #判断bond或者ae是否在自己的可用范围
+                                else:
+                                    if 'bond' in UdfRuleConfig[Line]['in-port']:
+                                        bond_id = int(UdfRuleConfig[Line]['in-port'].replace('bond',''))
+                                        sql1 = "SELECT min_bond_id FROM user WHERE user_name='%s'"%(user)
+                                        sql2 = "SELECT max_bond_id FROM user WHERE user_name='%s'"%(user)
+                                        min_bond_id = self.DBMgr.fetch_one(sql1)[0]
+                                        max_bond_id = self.DBMgr.fetch_one(sql2)[0]
+                                        if bond_id not in range(min_bond_id, max_bond_id+1):
+                                            print(u'    第%s行：输入交换机IP \'%s\' 端口组 \' %s \'属于其他用户，请修改bond组id为自己的可用范围后重试!'%(UdfRuleConfig[Line]['line'], UdfRuleConfig[Line]['in-switch'],UdfRuleConfig[Line]['in-port']))
+                                            return
+                                    
+                                    if 'ae' in UdfRuleConfig[Line]['in-port']:
+                                        ae_id = int(UdfRuleConfig[Line]['in-port'].replace('ae',''))
+                                        sql1 = "SELECT min_ae_id FROM user WHERE user_name='%s'"%(user)
+                                        sql2 = "SELECT max_ae_id FROM user WHERE user_name='%s'"%(user)
+                                        min_ae_id = self.DBMgr.fetch_one(sql1)[0]
+                                        max_ae_id = self.DBMgr.fetch_one(sql2)[0]
+                                        if ae_id not in range(min_ae_id, max_ae_id+1):
+                                            print(u'    第%s行：输入交换机IP \'%s\' 端口组 \' %s \'属于其他用户，请修改ae组id为自己的可用范围后重试!'%(UdfRuleConfig[Line]['line'], UdfRuleConfig[Line]['in-switch'],UdfRuleConfig[Line]['in-port']))
+                                            return
+                                
+                                SrcPort = self.convert_to_port_id(UdfRuleConfig[Line]['in-switch'], UdfRuleConfig[Line]['in-port'])
+                        
+                            #判断输入物理端口是否存在,以及是否被其他用户占用        
+                            else:
+                                InPort = self.convert_to_port_name_list(SwitchHardwareId, UdfRuleConfig[Line]['in-port'])
+                                if not self.Controller.is_port_exist(UdfRuleConfig[Line]['in-switch'], InPort):
+                                    print(u'    第%s行：输入交换机IP \'%s\' 不存在端口 \' %s \' （%s），请重试!'%(UdfRuleConfig[Line]['line'], UdfRuleConfig[Line]['in-switch'],UdfRuleConfig[Line]['in-port'],InPort))
+                                    return
+                                
+                                else:
+                                    switch_ip = UdfRuleConfig[Line]['in-switch'].replace('.','_')
+                                    sql = "SELECT occupied_by FROM %s WHERE port_name='%s'"%(
+                                        switch_ip,
+                                        InPort
+                                        )
+                                    print(sql)
+                                    result = self.DBMgr.fetch_one(sql)
+                                    #如果未被占用，则将端口信息暂存至SwitchPortDict
+                                    if result is None:
+                                        if not OccupiedPortDict.has_key(switch_ip):
+                                            OccupiedPortDict[switch_ip] = []
+                                        OccupiedPortDict[switch_ip].append(InPort)
+                                    
+                                    #如果已被自己占用，则不做任何处理
+                                    elif result == (user,):
+                                        pass
+                                    
+                                    #如果已被占用，则提示错误信息并中断
+                                    else:
+                                        print(u'    第%s行：输入交换机IP \'%s\' 端口 \' %s \' （%s）已被用户 \'%s\' 占用，请检查后重试!'%(UdfRuleConfig[Line]['line'], UdfRuleConfig[Line]['in-switch'],UdfRuleConfig[Line]['in-port'],InPort,result[0]))
+                                        break    
+                                    
+                                SrcPort = self.convert_to_port_id(UdfRuleConfig[Line]['in-switch'], InPort)
+                                    
+                    else:
+                        print(u'    第%s行：输入交换机IP \'%s\' 不存在，请重试!'%(UdfRuleConfig[Line]['line'], UdfRuleConfig[Line]['in-switch']))
+                        return
+                    
+                #如果输入交换机IP不存在，则提示错误信息并中断   
+                elif UdfRuleConfig[Line].has_key('in-switch') and (UdfRuleConfig[Line]['in-switch'] not in self.NodeInfo.get_switch_ip_list()):
+                    print(u'    第%s行：输入交换机IP \'%s\' 不存在，请重试!'%(UdfRuleConfig[Line]['line'], UdfRuleConfig[Line]['in-switch']))
+                    break
+                    
+                #如果未配置输入交换机，则提示错误信息并中断    
+                else:
+                    print(u'    第%s行：未配置输入交换机IP，请重试!'%(UdfRuleConfig[Line]['line']))
+                    break
+                #判断输出交换机是否存在
+                if UdfRuleConfig[Line].has_key('out-switch') and (UdfRuleConfig[Line]['out-switch'] in self.NodeInfo.get_switch_ip_list()):
+                    SwitchHardwareId = self.NodeInfo.check_switch_hardware(UdfRuleConfig[Line]['out-switch'])
+                    self.DBMgr.create_switch_table(UdfRuleConfig[Line]['out-switch'])
+                    #判断输出bond或者ae是否存在
+                    if ('ae' in UdfRuleConfig[Line]['out-port']) or ('bond' in UdfRuleConfig[Line]['out-port']):
+                        if not self.Controller.is_port_exist(UdfRuleConfig[Line]['out-switch'], UdfRuleConfig[Line]['out-port']):
+                            print(u'    第%s行：输出交换机IP \'%s\' 不存在端口组 \' %s \'，请重试!'%(UdfRuleConfig[Line]['line'], UdfRuleConfig[Line]['out-switch'],UdfRuleConfig[Line]['out-port']))
+                            return
+                            
+                        else:
+                            if 'bond' in UdfRuleConfig[Line]['out-port']:
+                                bond_id = int(UdfRuleConfig[Line]['out-port'].replace('bond',''))
+                                sql1 = "SELECT min_bond_id FROM user WHERE user_name='%s'"%(user)
+                                sql2 = "SELECT max_bond_id FROM user WHERE user_name='%s'"%(user)
+                                min_bond_id = self.DBMgr.fetch_one(sql1)[0]
+                                max_bond_id = self.DBMgr.fetch_one(sql2)[0]
+                                if bond_id not in range(min_bond_id, max_bond_id+1):
+                                    print(u'    第%s行：输出交换机IP \'%s\' 端口组 \' %s \'属于其他用户，请修改bond组id为自己的可用范围后重试!'%(UdfRuleConfig[Line]['line'], UdfRuleConfig[Line]['out-switch'],UdfRuleConfig[Line]['out-port']))
+                                    return
+                            
+                            if 'ae' in UdfRuleConfig[Line]['out-port']:
+                                ae_id = int(UdfRuleConfig[Line]['out-port'].replace('ae',''))
+                                sql1 = "SELECT min_ae_id FROM user WHERE user_name='%s'"%(user)
+                                sql2 = "SELECT max_ae_id FROM user WHERE user_name='%s'"%(user)
+                                min_ae_id = self.DBMgr.fetch_one(sql1)[0]
+                                max_ae_id = self.DBMgr.fetch_one(sql2)[0]
+                                if ae_id not in range(min_ae_id, max_ae_id+1):
+                                    print(u'    第%s行：输出交换机IP \'%s\' 端口组 \' %s \'属于其他用户，请修改ae组id为自己的可用范围后重试!'%(UdfRuleConfig[Line]['line'], UdfRuleConfig[Line]['out-switch'],UdfRuleConfig[Line]['out-port']))
+                                    return
+                                
+                        
+                        HostPort = self.convert_to_ofport(UdfRuleConfig[Line]['out-switch'], UdfRuleConfig[Line]['out-port'])
+                        #配置静态主机，将输出口绑定到静态主机
+                        prefix = '0-101.1'
+                        DestHost = self.convert_to_ip(HostId, prefix)
+                        HostMac = self.convert_to_mac(HostId+0x10100000)
+                        self.Controller.config_static_host(DestHost, HostMac, HostPort)
+                        HostId += 1
+                        
+                    #判断输出物理端口是否存在        
+                    else:
+                        OutPort = self.convert_to_port_name_list(SwitchHardwareId, UdfRuleConfig[Line]['out-port'])
+                        if not Controller.is_port_exist(UdfRuleConfig[Line]['out-switch'], OutPort):
+                            print(u'    第%s行：输出交换机IP \'%s\' 不存在端口 \' %s \' （%s），请重试!'%(UdfRuleConfig[Line]['line'], UdfRuleConfig[Line]['out-switch'],UdfRuleConfig[Line]['out-port'],OutPort))
+                            return
+                        
+                        else:
+                            switch_ip = UdfRuleConfig[Line]['out-switch'].replace('.','_')
+                            sql = "SELECT occupied_by FROM %s WHERE port_name='%s'"%(
+                                switch_ip,
+                                OutPort
+                                )
+                            result = self.DBMgr.fetch_one(sql)
+                            #如果未被占用，则将端口信息暂存至OccupiedPortDict
+                            if (result is None) or (result == (user,)):
+                                if not OccupiedPortDict.has_key(switch_ip):
+                                    OccupiedPortDict[switch_ip] = []
+                                OccupiedPortDict[switch_ip].append(OutPort)
+                            
+                            #如果已被占用，则提示错误信息并中断
+                            else:
+                                print(u'    第%s行：输入交换机IP \'%s\' 端口 \' %s \' （%s）已被用户 \'%s\' 占用，请检查后重试!'%(UdfRuleConfig[Line]['line'], UdfRuleConfig[Line]['out-switch'],UdfRuleConfig[Line]['out-port'],OutPort,result[0]))
+                                break    
+                        
+                        HostPort = self.convert_to_ofport(UdfRuleConfig[Line]['out-switch'], OutPort)
+                        #配置静态主机，将输出口绑定到静态主机
+                        DestHost = self.convert_to_ip(HostId, prefix = '0-101.1')
+                        HostMac = self.convert_to_mac(HostId+0x10100000)
+                        self.Controller.config_static_host(DestHost, HostMac, HostPort)
+                        HostId += 1
+                
+                #如果配置了目的主机，直接赋值
+                elif UdfRuleConfig[Line].has_key('destination-host'):
+                    DestHost = '0-%s'%UdfRuleConfig[Line]['destination-host']
+                
+                else:
+                    print(u'    第%s行：输出交换机IP \'%s\' 不存在，请重试!'%(UdfRuleConfig[Line]['line'], UdfRuleConfig[Line]['out-switch']))
+                    return
+                  
+                for SourceNode in SourceNodeList:
+                    rule = {
+                                'source-node': [
+                                    {
+                                        'id': '',
+                                        'rule': [
+                                            {
+                                            
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }
+                    
+                    if not Priority.has_key(SourceNode):
+                        Priority[SourceNode] = 3001
+                    
+                    rule['source-node'][0]['id'] = SourceNode
+                    rule['source-node'][0]['rule'][0]['priority'] = Priority[SourceNode]
+                    if UdfRuleConfig[Line].has_key('priority'):
+                        if UdfRuleConfig[Line]['priority'] != '':
+                            rule['source-node'][0]['rule'][0]['match-priority'] = UdfRuleConfig[Line]['priority']
+                    else:
+                        rule['source-node'][0]['rule'][0]['match-priority'] = MatchPriority
+                    if UdfRuleConfig[Line].has_key('in-port'):
+                        if SrcPort != '':
+                            rule['source-node'][0]['rule'][0]['match-port'] = SrcPort
+                    if UdfRuleConfig[Line].has_key('vid'):
+                        if UdfRuleConfig[Line]['vid'] != '':
+                            rule['source-node'][0]['rule'][0]['match-vid'] = UdfRuleConfig[Line]['vid']
+                    if UdfRuleConfig[Line].has_key('smac'):
+                        if UdfRuleConfig[Line]['smac'] != '':
+                            rule['source-node'][0]['rule'][0]['match-smac'] = UdfRuleConfig[Line]['smac']
+                    if UdfRuleConfig[Line].has_key('smac-mask'):
+                        if UdfRuleConfig[Line]['smac-mask'] != '':
+                            rule['source-node'][0]['rule'][0]['match-smac-mask'] = UdfRuleConfig[Line]['smac-mask']
+                    if UdfRuleConfig[Line].has_key('dmac'):
+                        if UdfRuleConfig[Line]['dmac'] != '':
+                            rule['source-node'][0]['rule'][0]['match-dmac'] = UdfRuleConfig[Line]['dmac']
+                    if UdfRuleConfig[Line].has_key('dmac-mask'):
+                        if UdfRuleConfig[Line]['dmac-mask'] != '':
+                            rule['source-node'][0]['rule'][0]['match-dmac-mask'] = UdfRuleConfig[Line]['dmac-mask']
+                    if UdfRuleConfig[Line].has_key('src-ip'):
+                        if UdfRuleConfig[Line]['src-ip'] != '':
+                            rule['source-node'][0]['rule'][0]['match-src-ip'] = UdfRuleConfig[Line]['src-ip']
+                    if UdfRuleConfig[Line].has_key('src-ip-mask'):
+                        if UdfRuleConfig[Line]['src-ip-mask'] != '':
+                            rule['source-node'][0]['rule'][0]['match-src-ip-mask'] = UdfRuleConfig[Line]['src-ip-mask']
+                    if UdfRuleConfig[Line].has_key('dst-ip'):
+                        if UdfRuleConfig[Line]['dst-ip'] != '':
+                            rule['source-node'][0]['rule'][0]['match-dst-ip'] = UdfRuleConfig[Line]['dst-ip']
+                    if UdfRuleConfig[Line].has_key('dst-ip-mask'):
+                        if UdfRuleConfig[Line]['dst-ip-mask'] != '':
+                            rule['source-node'][0]['rule'][0]['match-dst-ip-mask'] = UdfRuleConfig[Line]['dst-ip-mask']
+                    if UdfRuleConfig[Line].has_key('ip-protocol'):
+                        if UdfRuleConfig[Line]['ip-protocol'] != '':
+                            rule['source-node'][0]['rule'][0]['match-protocol'] = UdfRuleConfig[Line]['ip-protocol']
+                    if UdfRuleConfig[Line].has_key('src-port'):
+                        if UdfRuleConfig[Line]['src-port'] != '':
+                            rule['source-node'][0]['rule'][0]['match-src-port'] = UdfRuleConfig[Line]['src-port']
+                    if UdfRuleConfig[Line].has_key('dst-port'):
+                        if UdfRuleConfig[Line]['dst-port'] != '':
+                            rule['source-node'][0]['rule'][0]['match-dst-port'] = UdfRuleConfig[Line]['dst-port']        
+                    rule['source-node'][0]['rule'][0]['destination-host'] = DestHost
+                    
+                    UdfRuleList.append(rule)
+                    Priority[SourceNode] += 1
+            
+            
+            #标记端口为占用状态
+            for switch_ip in OccupiedPortDict.keys():
+                for port_name in OccupiedPortDict[switch_ip]:
+                    self.DBMgr.insert_occupied_port(switch_ip, port_name, user)
+            self.DBMgr.close()
+            return UdfRuleList
+            '''
+                    
+    def convert_to_ofport(self, switch_ip, port_name):
+        SwitchPortDict = self.NodeInfo.get_switch_port_dict()
+        for Port in SwitchPortDict[switch_ip]:
+            if port_name == Port['flow-node-inventory:name']:
+                return Port['id']
+    
+    def convert_to_port_id(self, switch_ip, port_name):
+        SwitchPortDict = self.NodeInfo.get_switch_port_dict()
+        for Port in SwitchPortDict[switch_ip]:
+            if port_name == Port['flow-node-inventory:name']:
+                return Port['flow-node-inventory:port-number']
+    
+    def convert_to_port_name_list(self, switch_hardware_id, port_list):
+        port_name_list = ''
+        for port_id in port_list.split(','):
+            #2028
+            if switch_hardware_id > 3:
+                port_name_list += 'xe-%s,'%port_id.replace('.','/')
+            #2017&2027
+            else:
+                port_name_list += 'xe-1/1/%s,'%port_id
+        return port_name_list[:-1]
+        
+    def convert_to_mac(self, digit):
+        mac = '{:012X}'.format(digit)
+        pattern = re.compile('.{2}')
+        mac = (':'.join(pattern.findall(mac)))
+        return mac  
+        
+    def convert_to_ip(self, digit, prefix='0-111.111'):
+        ip_high = int(digit/256)
+        ip_low = int(digit%256)
+        return '%s.%s.%s'%(prefix, ip_high, ip_low)
+    
+class node_info:
+    def __init__(self, controllerip='127.0.0.1', interval=10):
+        #通过restapi获取node信息：http://192.168.3.101:8181/restconf/operational/opendaylight-inventory:nodes
+        #目前本地调试，先从本地json读取信息
+        self.switch_info = ''
+        # 获取所有交换机的ip地址
+        self.controllerip = controllerip
+        self.RestConf = restconf(self.controllerip)
+        self.switch_info = self.RestConf.get_node_info()
+        self.interval = int(interval)
+        try:
+            self.switch_info = self.switch_info['nodes']['node']
+        except:
+            print(u'     未查询到任何交换机!')
+            return
+    
+    def get_switch_ip_list(self):
+        switch_ip_list = []
+        try:
+            switch_info = self.RestConf.get_node_info()
+            switch_info = switch_info['nodes']['node']
+            for node_description in switch_info:
+                switch_ip_list.append(node_description['flow-node-inventory:ip-address'])
+            return switch_ip_list
+        except:
+            return switch_ip_list
+        
+    def get_switch_port_dict(self):
+        switch_port_dict = {}
+        try:
+            switch_info = self.RestConf.get_node_info()
+            switch_info = switch_info['nodes']['node']
+            for node_description in switch_info:
+                switch_port_dict[node_description['flow-node-inventory:ip-address']] = node_description['node-connector']
+            return switch_port_dict
+        except:
+            return switch_port_dict
+        
+    def check_switch_hardware(self, switch_ip):
+    
+        #遍历所有交换机信息,查找是否有对应的ip地址
+        hardware = 0
+        if not self.get_switch_ip_list():
+            return '-NA-'
+        switch_info = self.RestConf.get_node_info()
+        switch_info = switch_info['nodes']['node']
+        for node_description in switch_info:
+            if node_description['flow-node-inventory:ip-address'] == switch_ip:
+                #2013
+                if '3922' in node_description['flow-node-inventory:hardware']:
+                    return 0
+            
+                #2017
+                if '5101' in node_description['flow-node-inventory:hardware']:
+                    return 1
+                
+                #2027-A
+                if '7032' in node_description['flow-node-inventory:hardware']:
+                    return 2
+
+                #2027-B
+                if '7712' in node_description['flow-node-inventory:hardware']:
+                    return 3
+                
+                #2028-B
+                if '2028-B' in node_description['flow-node-inventory:hardware']:
+                    return 4
+
+                #2028-A
+                if '2028' in node_description['flow-node-inventory:hardware']:
+                    return 5
+                
+    #获取交换机dpid
+    def get_switch_dpid_by_ip(self, switch_ip): 
+    
+        switch_dpid = 0
+        switch_info = self.RestConf.get_node_info()
+        switch_info = switch_info['nodes']['node']
+        for node_description in switch_info:
+            if node_description['flow-node-inventory:ip-address'] == switch_ip:
+                switch_dpid = node_description['id']
+                return switch_dpid
+
+        if switch_dpid == 0: 
+            return '-NA-'
+        
+    def get_switch_ip_by_dpid(self, switch_dpid):
+        IpDpidDict = self.get_switch_ip_dpid_dict()
+        for SwitchIp in IpDpidDict.keys():
+            if IpDpidDict[SwitchIp] == switch_dpid:
+                return SwitchIp
+        
+    #获取交换机dpid
+    def get_switch_ip_dpid_dict(self): 
+        switch_ip_dpid_dict = {}
+        switch_info = self.RestConf.get_node_info()
+        switch_info = switch_info['nodes']['node']
+        for node_description in switch_info:
+            for switch_ip in self.get_switch_ip_list():
+                if node_description['flow-node-inventory:ip-address'] == switch_ip:
+                    switch_ip_dpid_dict[switch_ip] = node_description['id']
+        return switch_ip_dpid_dict
+        
+    def get_controller_date(self, switch_ip):
+        controller_date = '' 
+        switch_info = self.RestConf.get_node_info()
+        switch_info = switch_info['nodes']['node']
+        for node_description in switch_info:
+            if node_description['flow-node-inventory:ip-address'] == switch_ip:
+                controller_date = node_description['flow-node-inventory:snapshot-gathering-status-start']['begin']
+                return controller_date
+
+        if controller_date == '':
+            return '-NA-'
+
+    #获取所有交换机所有端口详细信息，包括：设备ip，端口名称、逻辑端口号、端口当前速率、端口link状态、端口统计计数（收发报文、字节统计、错包、丢包等）
+    def get_switch_port_detail_info(self):
+        node_info_summary = {}
+        #遍历所有交换机
+        nodes_info = self.RestConf.get_node_info()
+        try:
+            nodes_info = nodes_info['nodes']['node']
+        except:
+            print(u'     未查询到任何交换机!')
+            return
+        for node_description in nodes_info:
+            tmp_node_info_summary = {}
+            #遍历每台交换机的所有端口统计信息
+            for node in node_description['node-connector']:
+                node_info = {}
+                #检查端口是否为实际物理端口，跳过ae、bond、lag等虚拟端口的统计信息，以免重复统计
+                node_is_physical_port = True
+                for s in ['ae','bond','lag','ecmp','br','eth','ma']:
+                    if s in node['flow-node-inventory:name']:
+                        node_is_physical_port = False
+  
+                if node_is_physical_port:
+                    node_info['port_number']        = node['flow-node-inventory:port-number']
+                    node_info['current_speed']      = node['flow-node-inventory:current-speed']/1000000
+                    node_info['link_down']          = node['flow-node-inventory:state']['link-down']
+            
+                    if node.has_key('opendaylight-port-statistics:flow-capable-node-connector-statistics'):
+                        node_info['rx_bytes']           = node['opendaylight-port-statistics:flow-capable-node-connector-statistics']['bytes']['received']
+                        node_info['rx_packets']         = node['opendaylight-port-statistics:flow-capable-node-connector-statistics']['packets']['received']
+                        node_info['rx_drop_packets']    = node['opendaylight-port-statistics:flow-capable-node-connector-statistics']['receive-drops']
+                        node_info['rx_error_packets']   = node['opendaylight-port-statistics:flow-capable-node-connector-statistics']['receive-errors']
+                        node_info['tx_bytes']           = node['opendaylight-port-statistics:flow-capable-node-connector-statistics']['bytes']['transmitted']
+                        node_info['tx_packets']         = node['opendaylight-port-statistics:flow-capable-node-connector-statistics']['packets']['transmitted']
+                        node_info['tx_drop_packets']    = node['opendaylight-port-statistics:flow-capable-node-connector-statistics']['transmit-drops']
+                        node_info['tx_error_packets']   = node['opendaylight-port-statistics:flow-capable-node-connector-statistics']['transmit-errors']
+                        node_info['nanosecond']         = node['opendaylight-port-statistics:flow-capable-node-connector-statistics']['duration']['nanosecond']
+                        node_info['second']             = node['opendaylight-port-statistics:flow-capable-node-connector-statistics']['duration']['second']
+                    #目前控制器存在问题，部分端口会存在概率不上报报文统计信息，需要特殊处理，目前是将所有流量统计信息置为-1
+                    else:
+                        node_info['rx_bytes']           = -1
+                        node_info['rx_packets']         = -1
+                        node_info['rx_drop_packets']    = -1
+                        node_info['rx_error_packets']   = -1
+                        node_info['tx_bytes']           = -1
+                        node_info['tx_packets']         = -1
+                        node_info['tx_drop_packets']    = -1
+                        node_info['tx_error_packets']   = -1
+                        node_info['nanosecond']         = -1
+                        node_info['second']             = -1
+                    #创建每个端口与统计信息的键值对，存入字典
+                    tmp_node_info_summary[node['flow-node-inventory:name']] = node_info
+
+            #创建每台交换机与所有端口统计信息的键值对，存入字典
+            node_info_summary[node_description['flow-node-inventory:ip-address']] = tmp_node_info_summary
+
+        return node_info_summary
+
+
+    #根据端口统计信息，提取端口名称，并对端口名称进行排序，返回值为正序排列的端口名称
+    def sort_switch_port(self, port_statis):
+        port_list = port_statis.keys()
+        #冒泡排序，根据端口的逻辑号（1-160）对端口进行排序
+        for m in range(len(port_list)-1):
+
+            for n in range(m+1,len(port_list)):
+                #获取端口逻辑id
+                portm = int(port_statis[port_list[m]]['port_number'])
+                portn = int(port_statis[port_list[n]]['port_number'])
+                port_tmp = ''
+                
+                #根据逻辑id判断是否为拆分端口，129-160为未拆分端口，需要减去128再×4
+                if portm > 128:
+                    portm = (portm - 128)*4
+
+                if portn > 128:
+                    portn = (portn - 128)*4
+
+                #如果前一个端口的逻辑号大于后一个端口，则交换端口名称,按照正序对端口进行排序
+                if portm > portn:
+                    port_tmp = port_list[m] 
+                    port_list[m] = port_list[n]
+                    port_list[n] = port_tmp
+
+        return port_list
+    
+    
+    #根据收集到的交换机统计信息，根据间隔时间差值，计算所有交换机端口的速率统计信息
+    def get_switch_port_traffic(self):
+        switch_traffic_summary = []
+        #初始流量信息
+        before_stat = self.get_switch_port_detail_info()
+        
+        #计数统计间隔时间
+        time.sleep(self.interval)
+        #最新流量信息
+        after_stat = self.get_switch_port_detail_info() 
+        #遍历所有交换机
+        if not before_stat or not after_stat:
+            return False
+        for switch_ip in before_stat:
+            port_traffic_summary = []
+            port_traffic_tmp = []
+            port_traffic_summary.append(switch_ip)
+            rx_pps_summary = 0
+            rx_mbps_summary = 0
+            rx_error_summary = 0
+            rx_drop_summary = 0
+            tx_pps_summary = 0
+            tx_mbps_summary = 0
+            tx_drop_summary = 0
+            sorted_port_list = self.sort_switch_port(before_stat[switch_ip])
+            for port in sorted_port_list:
+                port_traffic = []
+                #1、以初始流量信息为基准，检查最新流量信息中，是否有该交换机,如果没有则跳过该交换机
+                #2、检查端口前后2次的读取信息，必须2次都读到统计计数才会计算速率
+                if after_stat.has_key(switch_ip) and after_stat[switch_ip][port]['second']!=-1 and before_stat[switch_ip][port]['second']!=-1:
+                    #统计每个端口的收发统计信息
+                    duration = (after_stat[switch_ip][port]['second'] + (after_stat[switch_ip][port]['nanosecond'] / float(1000000000))) - (before_stat[switch_ip][port]['second'] + (before_stat[switch_ip][port]['nanosecond'] / float(1000000000)))
+                    
+                    rx_pps = (after_stat[switch_ip][port]['rx_packets'] - before_stat[switch_ip][port]['rx_packets']) / duration
+                    rx_mbps = (after_stat[switch_ip][port]['rx_bytes'] - before_stat[switch_ip][port]['rx_bytes']) * 8 / duration / 1000000
+                    rx_error_pps = (after_stat[switch_ip][port]['rx_error_packets'] - before_stat[switch_ip][port]['rx_error_packets']) / duration
+                    rx_drop_pps = (after_stat[switch_ip][port]['rx_drop_packets'] - before_stat[switch_ip][port]['rx_drop_packets']) / duration
+
+                    tx_pps = (after_stat[switch_ip][port]['tx_packets'] - before_stat[switch_ip][port]['tx_packets']) / duration
+                    tx_mbps = (after_stat[switch_ip][port]['tx_bytes'] - before_stat[switch_ip][port]['tx_bytes']) * 8 / duration / 1000000
+                    tx_drop_pps = (after_stat[switch_ip][port]['tx_drop_packets'] - before_stat[switch_ip][port]['tx_drop_packets']) / duration
+                    
+                    #端口名称、速率等信息
+                    port_name = port        #端口名称
+                    port_number = after_stat[switch_ip][port]['port_number']        #端口编号
+                    current_speed = after_stat[switch_ip][port]['current_speed']    #端口当前速率
+                    link_state = 'UP'                                               #端口link状态
+                    if  after_stat[switch_ip][port]['link_down']:
+                        link_state = 'DOWN'
+                    
+                    #对统计信息进行累加
+                    rx_pps_summary += rx_pps
+                    rx_mbps_summary += rx_mbps
+                    rx_error_summary += rx_error_pps
+                    rx_drop_summary += rx_drop_pps
+                    tx_pps_summary += tx_pps
+                    tx_mbps_summary += tx_mbps
+                    tx_drop_summary += tx_drop_pps
+                    
+                    #将端口统计信息添加进列表
+                    port_traffic.append(port_name)
+                    port_traffic.append(port_number)
+                    port_traffic.append(current_speed)
+                    port_traffic.append(link_state)
+                    port_traffic.append(rx_mbps)
+                    port_traffic.append(rx_pps)
+                    port_traffic.append(rx_drop_pps)
+                    port_traffic.append(rx_error_pps)
+                    port_traffic.append(tx_mbps)
+                    port_traffic.append(tx_pps)
+                    port_traffic.append(tx_drop_pps)
+
+                    port_traffic_tmp.append(port_traffic)
+
+                #如果前后2次中有任意一次没有独到速率信息，则将速率信息全部置为-1
+                else:
+                    rx_pps = -1
+                    rx_mbps = -1
+                    rx_error_pps = -1
+                    rx_drop_pps = -1
+
+                    tx_pps = -1
+                    tx_mbps = -1
+                    tx_drop_pps = -1
+                    
+                    #端口名称、速率等信息
+                    port_name = port        #端口名称
+                    port_number = after_stat[switch_ip][port]['port_number']        #端口编号
+                    current_speed = after_stat[switch_ip][port]['current_speed']    #端口当前速率
+                    link_state = 'UP'                                               #端口link状态
+                    if  after_stat[switch_ip][port]['link_down']:
+                        link_state = 'DOWN'
+                    
+                    #对统计信息进行累加
+                    
+                    #将端口统计信息添加进列表
+                    port_traffic.append(port_name)
+                    port_traffic.append(port_number)
+                    port_traffic.append(current_speed)
+                    port_traffic.append(link_state)
+                    port_traffic.append(rx_mbps)
+                    port_traffic.append(rx_pps)
+                    port_traffic.append(rx_drop_pps)
+                    port_traffic.append(rx_error_pps)
+                    port_traffic.append(tx_mbps)
+                    port_traffic.append(tx_pps)
+                    port_traffic.append(tx_drop_pps)
+
+                    port_traffic_tmp.append(port_traffic)
+
+            port_traffic_summary.append(port_traffic_tmp)
+
+
+            port_traffic_summary.append(rx_mbps_summary)
+            port_traffic_summary.append(rx_pps_summary)
+            port_traffic_summary.append(rx_drop_summary)                       
+            port_traffic_summary.append(rx_error_summary)
+            port_traffic_summary.append(tx_mbps_summary)
+            port_traffic_summary.append(tx_pps_summary)
+            port_traffic_summary.append(tx_drop_summary)
+            switch_traffic_summary.append(port_traffic_summary)
+
+        return switch_traffic_summary
+    
+    #显示交换机端口详细信息：包括交换机类型、物理位置、端口状态、占用信息等
+    def show_swtich_port_detail(self, switch_ip=''):
+        self.DBMgr = db_manager(
+                        '192.168.3.102',
+                        'root',
+                        'bane@8888',
+                        'sdn_controller'
+                        )
+        self.DBMgr.connect()
+        
+        switch_port_summary = {}
+        switch_port_detail = ''
+        switch_port_summary[switch_ip] = ''
+        hardware_info_tmp = ''
+        hardware_info_tmp += ' %s \n'%('_'*102)
+        switch_hardware = self.check_switch_hardware(switch_ip)
+        occupation_info = self.DBMgr.check_port_occupation(switch_ip)
+        switch_info = self.get_switch_port_detail_info()
+        port_status_tmp = []
+        port_status_tmp.append(switch_ip)
+        
+        #获取交换机部署位置
+        sql = 'SELECT floor,rack FROM hardware_location WHERE ip=\'%s\''%switch_ip
+        
+        try:
+            Position = self.DBMgr.fetch_one(sql)
+            self.DBMgr.close()
+        except Exception as e:
+            print(str(e))
+            self.DBMgr.close()
+            return
+        if Position is None:
+            Position = (0, 0)
+        
+        #获取交换机IP、硬件类型、DPID等信息
+        if switch_hardware == 0:
+            hardware_info_tmp += '| IP: %-17sHardware: %-15sDPID: %-49s|\n'%(switch_ip,'LTN-2013',self.get_switch_dpid_by_ip(switch_ip))
+        if switch_hardware == 1:
+            hardware_info_tmp += '| IP: %-17sHardware: %-15sDPID: %-49s|\n'%(switch_ip,'LTN-2017',self.get_switch_dpid_by_ip(switch_ip))
+        if switch_hardware == 2:
+            hardware_info_tmp += '| IP: %-17sHardware: %-15sDPID: %-49s|\n'%(switch_ip,'LTN-2027-A',self.get_switch_dpid_by_ip(switch_ip))
+        if switch_hardware == 3:
+            hardware_info_tmp += '| IP: %-17sHardware: %-15sDPID: %-49s|\n'%(switch_ip,'LTN-2027-B',self.get_switch_dpid_by_ip(switch_ip))
+        if switch_hardware == 4:
+            hardware_info_tmp += '| IP: %-17sHardware: %-15sDPID: %-49s|\n'%(switch_ip,'LTN-2028-B',self.get_switch_dpid_by_ip(switch_ip))
+        if switch_hardware == 5:
+            hardware_info_tmp += '| IP: %-17sHardware: %-15sDPID: %-49s|\n'%(switch_ip,'LTN-2028-A',self.get_switch_dpid_by_ip(switch_ip))
+        
+        
+        #获取控制器时间、部署物理位置
+        hardware_info_tmp += '| Controller Date: %-30s  Hardware Location: Rack #%-2s, Floor %-2s %s|\n'%(self.get_controller_date(switch_ip), Position[1], Position[0], ' '*14)
+    
+        hardware_info_tmp += '|%s|\n'%('-'*102)
+        hardware_info_tmp += '| PORT         PORT    CURRENT  LINK        OCCUPIED              OCCUPIED      %s|\n'%(' '*23)
+        hardware_info_tmp += '| NAME         NUMBER  SPEED    STATE       BY                    DATE          %s|\n'%(' '*23)
+        hardware_info_tmp += '|%s|\n'%('-'*102)
+        
+        sorted_port_list = self.sort_switch_port(switch_info[switch_ip])
+        for port in sorted_port_list:
+
+            #端口名称、速率等信息
+            port_name = port        #端口名称
+            port_number = switch_info[switch_ip][port]['port_number']        #端口编号
+            current_speed = switch_info[switch_ip][port]['current_speed']    #端口当前速率
+            link_state = 'UP'                                               #端口link状态
+            if  switch_info[switch_ip][port]['link_down']:
+                link_state = 'DOWN'
+            
+            occupied_user = '-NA-'
+            occupied_date = '-NA-'
+            
+            if not (occupation_info is None):
+                for sub_tuple in occupation_info:
+                    if sub_tuple[0] == port_name:
+                        occupied_user = sub_tuple[2]
+                        occupied_date = sub_tuple[3]
+                
+            #端口状态信息
+            hardware_info_tmp += '|%-14s%-8s%-9s%-12s%-22s%-37s|\n'%(port_name, port_number, current_speed, link_state, occupied_user, occupied_date)
+        
+        hardware_info_tmp += '|%s|\n'%('_'*102)    
+            
+        return hardware_info_tmp
+        
+    def show_switch_traffic_detail(self, switch_ip=''):
+        switch_traffic_summary = self.get_switch_port_traffic()
+        if not switch_traffic_summary:
+            return
+        port_statistics = ''
+        for switch in switch_traffic_summary:
+            port_statistics_tmp = ''
+            port_statistics_tmp += ' %s \n'%('_'*132)
+            switch_hardware = self.check_switch_hardware(switch[0])
+            #获取交换机IP、硬件类型、DPID等信息
+            if switch_hardware == 0:
+                port_statistics_tmp += '| IP: %-17sHardware: %-15sDPID: %-79s|\n'%(switch[0],'LTN-2013',self.get_switch_dpid_by_ip(switch[0]))
+            if switch_hardware == 1:
+                port_statistics_tmp += '| IP: %-17sHardware: %-15sDPID: %-79s|\n'%(switch[0],'LTN-2017',self.get_switch_dpid_by_ip(switch[0]))
+            if switch_hardware == 2:
+                port_statistics_tmp += '| IP: %-17sHardware: %-15sDPID: %-79s|\n'%(switch[0],'LTN-2027-A',self.get_switch_dpid_by_ip(switch[0]))
+            if switch_hardware == 3:
+                port_statistics_tmp += '| IP: %-17sHardware: %-15sDPID: %-79s|\n'%(switch[0],'LTN-2027-B',self.get_switch_dpid_by_ip(switch[0]))
+            if switch_hardware == 4:
+                port_statistics_tmp += '| IP: %-17sHardware: %-15sDPID: %-79s|\n'%(switch[0],'LTN-2028-B',self.get_switch_dpid_by_ip(switch[0]))
+            if switch_hardware == 5:
+                port_statistics_tmp += '| IP: %-17sHardware: %-15sDPID: %-79s|\n'%(switch[0],'LTN-2028-A',self.get_switch_dpid_by_ip(switch[0]))
+            
+            #获取控制器时间
+            port_statistics_tmp += '| Controller Date: %-114s|\n'%self.get_controller_date(switch[0])
+
+            port_statistics_tmp += '|%s|\n'%('-'*132)
+            port_statistics_tmp += '| PORT         PORT    CURRENT  LINK   RX          RX            RX DROP       RX ERROR      TX          TX            TX DROP       |\n'
+            port_statistics_tmp += '| Name         Number  SPEED    STATE  Mbit/s      Pkts/s        Pkts/s        Pkts/s        Mbit/s      Pkts/s        Pkts/s        |\n'
+            port_statistics_tmp += '|%s|\n'%('-'*132)
+
+            #添加每个端口的详细计数
+            for port in switch[1]:
+                port_statistics_tmp += '| %-13s%-8s%-3sG     %-7s%-12.2f%-14d%-14d%-14d%-12.2f%-14d%-14d|\n'%(port[0],port[1],port[2],port[3],port[4],port[5],port[6],port[7],port[8],port[9],port[10])
+            
+            port_statistics_tmp += '|%s|\n'%('_'*132)
+            
+            #添加汇总计数
+            port_statistics_tmp += '| SUMMARY%s%-12.2f%-14d%-14d%-14d%-12.2f%-14d%-14d|\n'%(' '*30,switch[2],switch[3],switch[4],switch[5],switch[6],switch[7],switch[8])
+
+            port_statistics_tmp += '|%s|\n'%('_'*132)
+
+            #如果指定交换机IP，则只返回指定交换机的计数
+            if switch_ip == switch[0]:
+                return port_statistics_tmp
+            
+            port_statistics += port_statistics_tmp
+
+        #如果未指定交换机IP，则返回所有交换机统计计数
+        return port_statistics
+
+
+    def show_switch_traffic_summary(self):
+        switch_traffic_summary = self.get_switch_port_traffic()
+        if not switch_traffic_summary:
+            return
+        port_statistics = ' %s \n'%('_'*165)
+
+        #控制器时间
+        port_statistics += '| Controller Date: %-147s|\n'%self.get_controller_date(switch_traffic_summary[0][0])
+
+        #生成表头
+        port_statistics += '|%s|\n'%('-'*165)
+        port_statistics += '|                                                         RX            RX              RX DROP         RX ERROR        TX            TX              TX DROP         |\n'
+        port_statistics += '| SWITCH IP            HARDWARE     DPID                  Mbit/s        Pkts/s          Pkts/s          Pkts/s          Mbit/s        Pkts/s          Pkts/s          |\n'
+        port_statistics += '|%s|\n'%('-'*165) 
+        for switch in switch_traffic_summary:
+            switch_hardware = self.check_switch_hardware(switch[0])
+            
+            #获取交换机IP、硬件类型、DPID等信息
+            if switch_hardware == 0:
+                switch_hardware = 'LTN-2013'
+            if switch_hardware == 1:
+                switch_hardware = 'LTN-2017'
+            if switch_hardware == 2:
+                switch_hardware = 'LTN-2027-A'
+            if switch_hardware == 3:
+                switch_hardware = 'LTN-2027-B'
+            if switch_hardware == 4:
+                switch_hardware = 'LTN-2028-B'
+            if switch_hardware == 5:
+                switch_hardware = 'LTN-2028-A'
+            else:
+                switch_hardware = '-NA-'
+            #每台交换机的汇总计数
+            port_statistics += '| %-21s%-13s%-22s%-14.2f%-16d%-16d%-16d%-14.2f%-16d%-16d|\n'%(switch[0],switch_hardware,self.get_switch_dpid_by_ip(switch[0])[9:],switch[2],switch[3],switch[4],switch[5],switch[6],switch[7],switch[8])
+
+        port_statistics += '|%s|\n'%('_'*165)
+        #port_statistics += '|'+'_'*165+'|\n'
+        return port_statistics
+
+#判断字符串是否为合法ipv4
+def is_valid_ipv4(ip):
+    compile_ip=re.compile('^(1\d{2}|2[0-4]\d|25[0-5]|[1-9]\d|[1-9])\.(1\d{2}|2[0-4]\d|25[0-5]|[1-9]\d|\d)\.(1\d{2}|2[0-4]\d|25[0-5]|[1-9]\d|\d)\.(1\d{2}|2[0-4]\d|25[0-5]|[1-9]\d|\d)$')
+    
+    if compile_ip.match(ip):
+        return True
+      
+    else:  
+        return False
+
+def is_linux_platform():
+    if sys.platform.startswith('win'):
+        return False
+    return True
+
+def press_enter_to_continue():
+    if IsLinux:
+        raw_input('... 按回车键以继续 '.decode('utf-8').encode('utf-8'))
+    else:
+        raw_input('... 按回车键以继续 '.decode('utf-8').encode('gbk'))
+
+def login_menu():
+
+    print(u'''
+    #------------------------------------------------------#
+    |#####   SDN控制器配置工具 (Version: %s)     #########|
+    |------------------------------------------------------|
+    |                    用户登录                          |
+    |                                                      |
+    |  1.请联系管理员分配用户名和密码                      |
+    |                                                      |
+    |  2.若遗忘密码，请联系管理员重置                      |
+    #------------------------------------------------------#
+       请输入用户名和密码：                                 
+'''%Version)
+    
+    DBMgr = db_manager(
+            '192.168.3.102',
+            'root',
+            'bane@8888',
+            'sdn_controller'
+            )
+    
+    DBMgr.connect()
+    while True:
+        try:
+            if IsLinux:
+                username = raw_input(' 用户名: '.decode('utf-8').encode('utf-8'))
+                password = raw_input(' 密 码 : '.decode('utf-8').encode('utf-8'))
+            else:
+                username = raw_input(' 用户名: '.decode('utf-8').encode('gbk'))
+                password = raw_input(' 密 码 : '.decode('utf-8').encode('gbk'))
+        except KeyboardInterrupt:
+            raw_input(' 按回车键以退出'.decode('utf-8').encode('gbk'))
+            DBMgr.close()
+            sys.exit()
+        if DBMgr.verify_login(username, password):
+            return username
+            break
+        else:
+            if IsLinux:
+                input = raw_input('         用户名或密码错误，请重试，如需重置密码，请联系管理员！\n         如需退出请按 Q \n         '.decode('utf-8').encode('utf-8'))
+            else:
+                input = raw_input('         用户名或密码错误，请重试，如需重置密码，请联系管理员！\n         如需退出请按 Q \n         '.decode('utf-8').encode('gbk'))
+                
+                
+            if input in ['q','Q']:
+                DBMgr.close()
+                sys.exit()
+    DBMgr.close()        
+
+def main_menu():
+    print( u'''
+    #------------------------------------------------------#
+    |#####   主菜单(Version: %s)                 #########|
+    |------------------------------------------------------|
+    | 1......查看控制器状态                                |
+    | 2......业务配置                                      |
+    | 3......端口及流量查询                                |
+    | 4......修改密码                                      |
+    |------------------------------------------------------|
+    | Q......退出                                          |
+    #------------------------------------------------------#
+    '''%Version
+    )
+
+    while True:
+        
+        if IsLinux:
+            input = raw_input('... 请输入你的选择:\n>>> '.decode('utf-8').encode('utf-8'))
+        else:
+            input = raw_input('... 请输入你的选择:\n>>> '.decode('utf-8').encode('gbk'))
+            
+        if input.isdigit() and (int(input) in range(1,5)):
+        
+            return int(input)
+            
+        elif input in ["q","Q"]:
+        
+            return input
+            
+        else:
+            print(u"    ^ 未识别的选择 \'%s\', 请重试！(1-4,Q)"%input)
+
+def service_config_menu():
+
+    print(u'''
+    #------------------------------------------------------#
+    |         新增配置(Version: %s)                       |
+    |------------------------------------------------------|
+    | 1.......配置转发规则                                 |
+    |------------------------------------------------------|
+    |         查询配置                                     |
+    |------------------------------------------------------|
+    | 2.......查询转发规则                                 |
+    | 3.......查询交换机端口状态及占用情况                 |
+    |------------------------------------------------------|
+    |         删除配置                                     |
+    |------------------------------------------------------|
+    | 4.......删除转发规则                                 |
+    | 5.......强制释放交换机端口                           |
+    |------------------------------------------------------|
+    | H.......帮助                                         |
+    | Q.......返回                                         |
+    #------------------------------------------------------#
+'''%Version)
+    while True:
+        
+        if IsLinux:
+            input = raw_input('... 请输入你的选择:\n>>> '.decode('utf-8').encode('utf-8'))
+        else:
+            input = raw_input('... 请输入你的选择:\n>>> '.decode('utf-8').encode('gbk'))
+        input = input.replace(' ','')
+        if input.isdigit() and (int(input) in range(1,10)):
+        
+            return int(input)
+        
+        elif input in ["q","Q"]:
+        
+            return input
+
+        elif input in ["h", "H"]:
+            print(u'''
+                略
+                ''')
+            
+        else:
+            print(u'    ^ 未识别的选择 \'%s\'，请重试！（1-10，H，Q）'%input)
+        
+def traffic_display_menu():
+
+    print(u'''
+    #------------------------------------------------------#
+    |         查看流量(Version: %s)                       |
+    |------------------------------------------------------|
+    | 1.......查看所有交换机的详细流量                     |
+    | 2.......查看指定交换机的详细流量                     |
+    | 3.......查看所有交换机的汇总流量                     |
+    |------------------------------------------------------|
+    | H.......帮助                                         |
+    | Q.......返回                                         |
+    #------------------------------------------------------#
+'''%Version)
+    while True:
+        if IsLinux:
+            input = raw_input('... 请输入你的选择:\n>>> '.decode('utf-8').encode('utf-8'))
+        else:
+            input = raw_input('... 请输入你的选择:\n>>> '.decode('utf-8').encode('gbk'))
+        if input.isdigit() and (int(input) in range(1,4)):
+        
+            return int(input)
+            
+        elif input in ["q","Q"]:
+        
+            return input
+
+        elif input in ["h", "H"]:
+            print(u'''
+                略
+                ''')
+            
+        else:
+            print(u'    ^ 未识别的选择 \'%s\'，请重试！（1-4，H，Q）'%input)
+   
+
+if __name__ == '__main__':
+    
+    IsLinux = is_linux_platform()
+    
+    #用户登录
+    User = login_menu()
+    
+    #查询控制器ip
+    ControllerIP = ''
+    DBMgr = db_manager(
+            '192.168.3.102',
+            'root',
+            'bane@8888',
+            'sdn_controller'
+            )
+    controller_ip_sql = 'SELECT ip FROM controller'
+    username_sql = "SELECT user_name FROM user where name='%s'"%User
+    try:
+        DBMgr.connect()
+        result = DBMgr.fetch_one(controller_ip_sql)
+        ControllerIP = result[0] 
+        UserName = DBMgr.fetch_one(username_sql)[0]
+    except Exception as e:
+        print(str(e))
+        DBMgr.close()
+    
+    #初始化配置控制器配置
+    Controller = restconf(ControllerIP)
+    Controller.config_destination_host()
+    Nodes = node_info(ControllerIP)
+    ConfigHandler = config_handler(ControllerIP)
+    
+    #配置主机老化时间        
+    if Controller.get_host_timeout() == 0:
+        Controller.config_host_timeout(120)
+    #进入主界面菜单
+    while True:
+        input = main_menu()
+        if input == 1:
+            ControllerInfo = json.loads(Controller.get_controller_info()['debug']['info'])
+            print(u''' 
+        控制器状态
+        -------------------------------------------------------------------------------
+               控制器IP : %s
+               软件版本 : %s
+               启动时间 : %s
+               系统时间 : %s
+         是否为主控制器 : %s
+               主机数量 : %s台
+             交换机数量 : %s台'''%(
+                      ControllerIP,
+                      ControllerInfo['nVerSoft'],
+                      time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ControllerInfo['nBgnTime']/1000)),
+                      time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ControllerInfo['nRecTime']/1000)),
+                      ControllerInfo['sActRole'],
+                      ControllerInfo['nTotHost'],
+                      ControllerInfo['nTotNode']
+                       )
+                  )
+            SwitchIpList = Nodes.get_switch_ip_list()
+            if SwitchIpList:
+                print(u'%sIP地址            硬件型号     设备位置'%(' '*26))      
+                
+                SwitchHwDict = {
+                                0:'LTN-2013',
+                                1:'LTN-2017',
+                                2:'LTN-2027-A',
+                                3:'LTN-2027-B',
+                                4:'LTN-2028-B',
+                                5:'LTN-2028-A'
+                                }
+                for SwitchIp in SwitchIpList:
+                    HwId = Nodes.check_switch_hardware(SwitchIp)
+                    sql = 'SELECT floor,rack FROM hardware_location WHERE ip=\'%s\''%SwitchIp
+                    Position = ''
+                    try:
+                        DBMgr.connect()
+                        Position = DBMgr.fetch_one(sql)
+                        DBMgr.close()
+                    except Exception as e:
+                        print(str(e))
+                        DBMgr.close() 
+                    
+                    if Position is None:
+                        print(u'''%s%-18s%-13s未指定'''%(
+                        ' '*26,
+                        SwitchIp,
+                        SwitchHwDict[HwId],
+                        ))
+                    else:
+                        print(u'''%s%-18s%-13s%-2s楼机柜%-2s'''%(
+                        ' '*26,
+                        SwitchIp,
+                        SwitchHwDict[HwId],
+                        Position[0],
+                        Position[1]
+                        ))      
+            
+            print(u'%s%s'%(' '*8, '-'*79))
+            press_enter_to_continue()
+            
+        #业务配置界面
+        elif input == 2:
+            DmacRedirectRule = ''
+            SwitchIpList = ''
+            while True:
+                input = service_config_menu()
+                if input == 1:
+                    if IsLinux:
+                        UdfRuleCmd = raw_input('... 此操作将删除现有转发规则，确认继续执行吗？(y|n)[n]:\n>>> '.decode('utf-8').encode('utf-8'))
+                    else:
+                        UdfRuleCmd = raw_input('... 此操作将删除现有转发规则，确认继续执行吗？(y|n)[n]:\n>>> '.decode('utf-8').encode('gbk'))
+                    if UdfRuleCmd in ['y', 'Y']:
+                        #删除所有自定义规则
+                        print(u'    删除当前转发规则:')
+                        Controller.del_rule('udf_rule')
+                        Controller.del_static_host('0-101', 'udf_static')
+                        print(u'      配置删除结束')
+                        Controller.config_udf_rule('udf_rule.config', UserName)
+                        press_enter_to_continue()
+                #配置bond组
+                #elif input == 2:
+                #    while True:
+                #        if IsLinux:
+                #            SwitchIp = raw_input('... 需要在哪台交换机上创建Bond组，请输入对应IP:\n>>> '.encode('utf-8'))
+                #        else:
+                #            SwitchIp = raw_input('... 需要在哪台交换机上创建Bond组，请输入对应IP:\n>>> '.encode('gbk'))
+                #        if SwitchIp  not in Nodes.get_switch_ip_list():
+                #            print(u'    交换机IP不存在，请重试！')
+                #            press_enter_to_continue()
+                #        else:
+                #            SwitchHardwareId = Nodes.check_switch_hardware(SwitchIp)
+                #            SwitchIp2 = SwitchIp.replace('.','_')
+                #            min_sql1 = "SELECT min_bond_id FROM user WHERE name=\'%s\'"%(User)
+                #            max_sql1 = "SELECT max_bond_id FROM user WHERE name=\'%s\'"%(User)
+                #            try:
+                #                DBMgr.connect()
+                #                #创建交换机数据表
+                #                DBMgr.create_switch_table(SwitchIp2)
+                #                #获取bond组的范围
+                #                MinBondId = DBMgr.fetch_one(min_sql1)[0]
+                #                MaxBondId = DBMgr.fetch_one(max_sql1)[0]
+                #                while True:
+                #                    if IsLinux:
+                #                        BondId = raw_input(('.... 输入需要创建的bond组id，范围（%s-%s）\n>>>  '%(MinBondId, MaxBondId)).encode('utf-8'))
+                #                    else:
+                #                        BondId = raw_input(('.... 输入需要创建的bond组id，范围（%s-%s）\n>>>  '%(MinBondId, MaxBondId)).encode('gbk'))
+                #                    if not (BondId.isdigit() and (int(BondId) in range(MinBondId, MaxBondId+1))):
+                #                        print(u'     Bond组id范围输入错误，请重试！')
+                #                        press_enter_to_continue()
+                #                    else:
+                #                        while True:
+                #                            IsPortValid = True
+                #                            PortNameStr = ''
+                #                            PortNameList = []
+                #                            if IsLinux:
+                #                                PortStr = raw_input('..... 需要添加的端口（格式：1.1 5.1 6.3 使用空格隔开各成员端口）\n>>>   '.encode('utf-8'))
+                #                            else:
+                #                                PortStr = raw_input('..... 需要添加的端口（格式：1.1 5.1 6.3 使用空格隔开各成员端口）\n>>>   '.encode('gbk'))
+                #                            PortList = PortStr.split(' ')
+                #                            for PortId in PortList:
+                #                                PortName = ConfigHandler.convert_to_port_name_list(SwitchHardwareId, PortId)
+                #                                if not Controller.is_port_exist(SwitchIp, PortName):
+                #                                    print(u'      交换机IP \'%s\' 不存在端口 \' %s \'，请重试!'%(SwitchIp, PortName))
+                #                                    press_enter_to_continue()
+                #                                    IsPortValid = False
+                #                                PortNameStr += PortName + ','
+                #                                PortNameList.append(PortName)
+                #                                
+                #                            if IsPortValid:
+                #                                #配置bond组
+                #                                Controller.config_bond_group(SwitchIp, SwitchHardwareId, BondId, PortNameStr[:-1])
+                #                                #将端口改为占用状态
+                #                                for PortName in PortNameList:
+                #                                    result = DBMgr.insert_occupied_port(SwitchIp2, PortName, UserName)
+                #                                    
+                #                                if Controller.is_bond_ae_exist('bond'+BondId, SwitchIp):
+                #                                    print(u'      交换机IP：\'%s\'，Bond组：\'bond%s\'，成员端口：\'%s\' 配置成功!'%(SwitchIp, BondId, PortNameStr[:-1]))
+                #                                else:
+                #                                    print(u'      交换机IP：\'%s\'，Bond组：\'bond%s\'，成员端口：\'%s\' 配置失败，请重试!'%(SwitchIp, BondId, PortNameStr[:-1]))
+                #                                press_enter_to_continue()
+                #                            break
+                #                    break
+                #            except Exception as e:
+                #                print(str(e))
+                #                DBMgr.close() 
+                #            
+                #        break
+                    
+                #配置出口组ae
+                #elif input == 3:
+                #    while True:
+                #        if IsLinux:
+                #            SwitchIp = raw_input('... 需要在哪台交换机上创建ae组，请输入对应IP:\n>>> '.encode('utf-8'))
+                #        else:
+                #            SwitchIp = raw_input('... 需要在哪台交换机上创建ae组，请输入对应IP:\n>>> '.encode('gbk'))
+                #        if SwitchIp  not in Nodes.get_switch_ip_list():
+                #            print(u'    交换机IP不存在，请重试！')
+                #            press_enter_to_continue()
+                #        else:
+                #            SwitchHardwareId = Nodes.check_switch_hardware(SwitchIp)
+                #            while True:
+                #                if IsLinux:
+                #                    AeId = raw_input('.... 输入需要创建的ae组id，范围（21-40）\n>>>  '.encode('utf-8'))
+                #                else:
+                #                    AeId = raw_input('.... 输入需要创建的ae组id，范围（21-40）\n>>>  '.encode('gbk'))
+                #                if not (AeId.isdigit() and (int(AeId) in range(21,41))):
+                #                    print(u'     ae组id范围输入错误，请重试！')
+                #                    press_enter_to_continue()
+                #                else:
+                #                    while True:
+                #                        IsPortValid = True
+                #                        PortNameStr = ''
+                #                        if IsLinux:
+                #                            PortStr = raw_input('..... 需要添加的端口（格式：1.1 5.1 6.3 使用空格隔开各成员端口）\n>>>   '.encode('utf-8'))
+                #                        else:
+                #                            PortStr = raw_input('..... 需要添加的端口（格式：1.1 5.1 6.3 使用空格隔开各成员端口）\n>>>   '.encode('gbk'))
+                #                        PortList = PortStr.split(' ')
+                #                        for PortId in PortList:
+                #                            PortName = ConfigHandler.convert_to_port_name_list(SwitchHardwareId, PortId)
+                #                            if not Controller.is_port_exist(SwitchIp, PortName):
+                #                                print(u'      交换机IP \'%s\' 不存在端口 \' %s \'，请重试!'%(SwitchIp, PortId))
+                #                                press_enter_to_continue()
+                #                                IsPortValid = False
+                #                            PortNameStr += PortName + ','
+                #                            
+                #                        if IsPortValid:
+                #                            Controller.config_ae_group(SwitchIp, SwitchHardwareId, AeId, PortNameStr[:-1])
+                #                            if Controller.is_bond_ae_exist('ae'+AeId, SwitchIp):
+                #                                print(u'      交换机IP：\'%s\'，ae组：\'ae%s\'，成员端口：\'%s\' 配置成功!'%(SwitchIp, AeId, PortNameStr[:-1]))
+                #                            else:
+                #                                print(u'      交换机IP：\'%s\'，ae组：\'ae%s\'，成员端口：\'%s\' 配置失败，请重试!'%(SwitchIp, AeId, PortNameStr[:-1]))
+                #                            press_enter_to_continue()
+                #                        break
+                #                break
+                #        break
+                    
+                         
+                elif input == 2:
+                    print(u'     该功能暂未支持，请重试！')
+                    press_enter_to_continue()
+                
+                elif input == 3:
+                    if IsLinux:
+                        SwitchIp = raw_input('... 请输入需要查询的交换机IP，或直接回车显示所有交换机端口状态: '.decode('utf-8').encode('utf-8'))
+                    else:
+                        SwitchIp = raw_input('... 请输入需要查询的交换机IP，或直接回车显示所有交换机端口状态: '.decode('utf-8').encode('gbk'))
+                    
+                    SwitchIpList = Nodes.get_switch_ip_list()
+                    if SwitchIp == '':
+                        for switch_ip in SwitchIpList:
+                            print(Nodes.show_swtich_port_detail(switch_ip))
+                    
+                    elif SwitchIp in SwitchIpList:
+                        print(Nodes.show_swtich_port_detail(SwitchIp))
+                    
+                    else:
+                        print(u'    交换机IP不存在，请重试！')    
+                    
+                    press_enter_to_continue()
+                
+                elif input in ['q','Q']:
+                    break    
+                
+        elif input == 3:
+            while True:
+                input = traffic_display_menu()
+                if input == 1:
+                    print(u'     正在统计最近%s秒内的平均流量，请稍等...'%Nodes.interval)
+                    while True:
+                        try:
+                            log_msg = Nodes.show_switch_traffic_detail()
+                            print(log_msg)
+                            print(u'     持续刷新中，按Ctrl + C退出...')
+                        except KeyboardInterrupt:
+                            break
+                    press_enter_to_continue()
+                elif input == 2:
+                    if IsLinux:
+                        SwitchIp = raw_input('... 请输入需要查询的交换机IP: '.decode('utf-8').encode('utf-8'))
+                    else:
+                        SwitchIp = raw_input('... 请输入需要查询的交换机IP: '.decode('utf-8').encode('gbk'))
+                    if SwitchIp  not in Nodes.get_switch_ip_list():
+                        print(u'    交换机IP不存在，请重试！')    
+                    else: 
+                        print(u'     正在统计最近%s秒内的平均流量，请稍等...'%Nodes.interval)
+                        while True:
+                            try:
+                                log_msg = Nodes.show_switch_traffic_detail(SwitchIp)
+                                print(log_msg)
+                                print(u'     持续刷新中，按Ctrl + C退出...')
+                            except KeyboardInterrupt:
+                                break
+                        press_enter_to_continue()
+                
+                elif input == 3:
+                    print(u'     正在统计最近%s秒内的平均流量，请稍等...'%Nodes.interval)
+                    while True:
+                        try:
+                            log_msg = Nodes.show_switch_traffic_summary()
+                            print(log_msg)
+                            print(u'     持续刷新中，按Ctrl + C退出...')
+                        except KeyboardInterrupt:
+                            break
+                    press_enter_to_continue()
+                        
+                elif input in ['q','Q']:
+                    break
+                
+        elif input == 4:
+            charset = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+            if IsLinux:
+                OldPassword = raw_input('... 请输入当前密码：'.decode('utf-8').encode('utf-8'))
+            else:
+                OldPassword = raw_input('... 请输入当前密码：'.decode('utf-8').encode('gbk'))
+                
+            DBMgr.connect()
+            if DBMgr.verify_login(User, OldPassword):
+                DBMgr.close()
+                if IsLinux:
+                    NewPassword1 = raw_input('... 请输入新密码（8-16位，支持大小写字母及数字）：'.decode('utf-8').encode('utf-8'))
+                else:
+                    NewPassword1 = raw_input('... 请输入新密码（8-16位，支持大小写字母及数字）：'.decode('utf-8').encode('gbk'))
+                
+                if len(NewPassword1) <= 16 and len(NewPassword1) >= 8:
+                    IsPasswdLegal = True
+                    for char in NewPassword1:
+                        if not (char in charset):
+                            IsPasswdLegal = False
+                    if IsPasswdLegal:
+                        if IsLinux:
+                            NewPassword2 = raw_input('... 请确认新密码（8-16位，支持大小写字母及数字）：'.decode('utf-8').encode('utf-8'))
+                        else:
+                            NewPassword2 = raw_input('... 请确认新密码（8-16位，支持大小写字母及数字）：'.decode('utf-8').encode('gbk'))
+                        
+                        if NewPassword1 == NewPassword2:
+                            DBMgr.connect()
+                            condition = "name='%s'"%User
+                            DBMgr.update('user', 'password', NewPassword1, condition )
+                            if DBMgr.verify_login(User, NewPassword1):
+                                print(u'... 密码修改成功！')
+                            
+                            else:
+                                print(u'... 密码修改失败，请重试！') 
+                        else:
+                            print(u'... 两次输入的密码不一致，请重试！') 
+                    
+                    else:
+                        print(u'... 密码包含非法字符，请重试！')
+                
+                else:
+                    print(u'... 密码长度不符合要求，请重试！')
+            
+            else:
+                print(u'... 当前密码错误，请重试！')
+            
+            press_enter_to_continue()
+        
+        elif input in['q','Q']:
+            sys.exit()
